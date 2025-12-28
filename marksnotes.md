@@ -1,39 +1,61 @@
+I installed an Ubuntu on a virtual box on a windows 
 
-step 1 install wsl
-step 2 install ubuntu
+Then inside Ubuntu 
 
 ```bash
 sudo apt update
-sudo apt install -y \
-  build-essential git python3 \
+sudo apt install -y build-essential git python3 \
   gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-  nasm iasl uuid-dev \
-  qemu-system-x86 qemu-system-aarch64 \
-  ovmf qemu-efi-aarch64 \
-  mtools dosfstools
+  nasm iasl uuid-dev
 ```
 
+## Build instructions (EDK2)
+
+### 1) Clone EDK2
+
+```bash
+mkdir UEFI-app
+cd UEFI-app
+git clone https://github.com/tianocore/edk2.git
+cd edk2
+git submodule update --init --recursive
 ```
-Practical recommendation
 
-Best workflow on Windows:
-
-Windows 11 + WSL2 (Ubuntu)
-
-Build with EDK2 inside WSL
-
-Test in:
-
-QEMU (fast, no reboot)
-
-Final test on:
-
-Raspberry Pi 5 hardware
-
-This is a very common and well-supported UEFI development setup.
+```bash 
+cd ..
+git clone https://github.com/faridani/uefi-2D-heat-diffusion.git
+cp -r ./uefi-2D-heat-diffusion/ ./edk2/Heat2D/
 ```
 
 
-Cons
-* All training wheels are removed. There is no debugger in this level
-* If a virus gets in, it's game over. You cannot install an antivirus here 
+### 2) Build BaseTools and set up the environment
+
+```bash
+make -C BaseTools
+. edksetup.sh
+```
+
+# Now build 
+
+```bash
+sudo apt update
+sudo apt install gcc-aarch64-linux-gnu g++-aarch64-linux-gnu make uuid-dev 
+sudo apt install -y qemu-system-arm qemu-system-aarch64 qemu-efi-aarch64 mtools dosfstools
+```
+
+
+
+NOW BUILD 
+
+# ====== 2) Build your UEFI app (DEBUG) ======
+build -a AARCH64 -t GCC5 -b DEBUG -p Heat2D/Heat2D.dsc
+
+# Your output EFI will be here:
+# Build/Heat2DPlatform/DEBUG_GCC5/AARCH64/Heat2D.efi
+
+From this point on you should be able to run the rest of 
+Head2D.sh and see the code 
+
+
+
+

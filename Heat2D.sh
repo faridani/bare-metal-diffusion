@@ -1,5 +1,5 @@
 # ====== 0) Go to your edk2 workspace ======
-cd ~/Desktop/edk2
+
 
 # ====== 1) Set up the EDK2 build environment ======
 . edksetup.sh
