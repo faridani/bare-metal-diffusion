@@ -24,8 +24,7 @@ git submodule update --init --recursive
 ```bash 
 cd ..
 git clone https://github.com/faridani/uefi-2D-heat-diffusion.git
-cp -r ./uefi-2D-heat-diffusion/ ./edk2/Heat2D/
-```
+mv ./uefi-2D-heat-diffusion ./edk2/Heat2D
 
 
 ### 2) Build BaseTools and set up the environment
