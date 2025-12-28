@@ -1,0 +1,761 @@
+#include <Uefi.h>
+#include <Base.h>
+
+#include <Library/UefiLib.h>
+#include <Library/UefiApplicationEntryPoint.h>
+#include <Library/UefiBootServicesTableLib.h>
+#include <Library/MemoryAllocationLib.h>
+#include <Library/BaseMemoryLib.h>
+#include <Library/PrintLib.h>
+
+#include <Protocol/GraphicsOutput.h>
+#include <Protocol/SimplePointer.h>
+#include <Protocol/AbsolutePointer.h>
+
+typedef enum {
+  BC_DIRICHLET_COLD = 0,   // fixed cold edges (0)
+  BC_NEUMANN_INSULATED,    // zero-flux edges
+  BC_MIXED,                // left/right cold, top/bottom insulated
+  BC_COUNT
+} BOUNDARY_MODE;
+
+typedef struct {
+  EFI_GRAPHICS_PIXEL_FORMAT Fmt;
+  EFI_PIXEL_BITMASK         Masks;  // only used when Fmt == PixelBitMask
+} PIXEL_PACKER;
+
+STATIC
+float
+ClampF32(float v, float lo, float hi)
+{
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+STATIC
+INT32
+ClampI32(INT32 v, INT32 lo, INT32 hi)
+{
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+STATIC
+UINT32
+Scale8ToMask(UINT8 c, UINT32 mask)
+{
+  if (mask == 0) return 0;
+
+  // Find shift (lsb position)
+  UINT32 shift = 0;
+  UINT32 tmp = mask;
+  while ((tmp & 1u) == 0u) {
+    tmp >>= 1;
+    shift++;
+    if (shift >= 32) return 0; // defensive
+  }
+
+  // Count contiguous bits
+  UINT32 bits = 0;
+  while ((tmp & 1u) == 1u) {
+    tmp >>= 1;
+    bits++;
+    if (bits >= 32) break;
+  }
+
+  if (bits == 0) return 0;
+
+  UINT32 maxVal = (bits >= 32) ? 0xFFFFFFFFu : ((1u << bits) - 1u);
+
+  // Map 0..255 -> 0..maxVal with rounding
+  UINT32 scaled = (((UINT32)c) * maxVal + 127u) / 255u;
+
+  return (scaled << shift) & mask;
+}
+
+STATIC
+UINT32
+PackPixel(const PIXEL_PACKER *P, UINT8 r, UINT8 g, UINT8 b)
+{
+  switch (P->Fmt) {
+    case PixelRedGreenBlueReserved8BitPerColor:
+      // memory: [R][G][B][X]
+      return ((UINT32)r) | ((UINT32)g << 8) | ((UINT32)b << 16) | (0xFFu << 24);
+
+    case PixelBlueGreenRedReserved8BitPerColor:
+      // memory: [B][G][R][X]
+      return ((UINT32)b) | ((UINT32)g << 8) | ((UINT32)r << 16) | (0xFFu << 24);
+
+    case PixelBitMask: {
+      UINT32 out = 0;
+      out |= Scale8ToMask(r, P->Masks.RedMask);
+      out |= Scale8ToMask(g, P->Masks.GreenMask);
+      out |= Scale8ToMask(b, P->Masks.BlueMask);
+      // Set reserved bits to 1 if present (often alpha/reserved)
+      if (P->Masks.ReservedMask != 0) {
+        out |= P->Masks.ReservedMask;
+      }
+      return out;
+    }
+
+    default:
+      // PixelBltOnly should be rejected earlier.
+      return ((UINT32)b) | ((UINT32)g << 8) | ((UINT32)r << 16) | (0xFFu << 24);
+  }
+}
+
+STATIC
+VOID
+TempToRGB(float t, UINT8 *r, UINT8 *g, UINT8 *b)
+{
+  t = ClampF32(t, 0.0f, 1.0f);
+
+  // "thermal" ramp: blue -> cyan -> green -> yellow -> red -> white
+  float x = t * 5.0f; // 0..5
+
+  if (x < 1.0f) {            // blue -> cyan
+    *r = 0;
+    *g = (UINT8)(x * 255.0f);
+    *b = 255;
+  } else if (x < 2.0f) {     // cyan -> green
+    *r = 0;
+    *g = 255;
+    *b = (UINT8)((2.0f - x) * 255.0f);
+  } else if (x < 3.0f) {     // green -> yellow
+    *r = (UINT8)((x - 2.0f) * 255.0f);
+    *g = 255;
+    *b = 0;
+  } else if (x < 4.0f) {     // yellow -> red
+    *r = 255;
+    *g = (UINT8)((4.0f - x) * 255.0f);
+    *b = 0;
+  } else {                   // red -> white
+    *r = 255;
+    *g = (UINT8)((x - 4.0f) * 255.0f);
+    *b = (UINT8)((x - 4.0f) * 255.0f);
+  }
+}
+
+STATIC
+BOOLEAN
+TryReadKey(EFI_SYSTEM_TABLE *SystemTable, EFI_INPUT_KEY *OutKey)
+{
+  EFI_STATUS st = SystemTable->ConIn->ReadKeyStroke(SystemTable->ConIn, OutKey);
+  return !EFI_ERROR(st);
+}
+
+STATIC
+VOID
+ApplyBoundary(float *T, INT32 NX, INT32 NY, BOUNDARY_MODE Mode)
+{
+  if (Mode == BC_DIRICHLET_COLD) {
+    // edges fixed cold
+    for (INT32 i = 0; i < NX; i++) {
+      T[i] = 0.0f;
+      T[(NY-1)*NX + i] = 0.0f;
+    }
+    for (INT32 j = 0; j < NY; j++) {
+      T[j*NX] = 0.0f;
+      T[j*NX + (NX-1)] = 0.0f;
+    }
+    return;
+  }
+
+  if (Mode == BC_NEUMANN_INSULATED) {
+    // zero-flux: copy nearest interior
+    for (INT32 i = 1; i < NX-1; i++) {
+      T[0*NX + i]      = T[1*NX + i];
+      T[(NY-1)*NX + i] = T[(NY-2)*NX + i];
+    }
+    for (INT32 j = 1; j < NY-1; j++) {
+      T[j*NX + 0]      = T[j*NX + 1];
+      T[j*NX + (NX-1)] = T[j*NX + (NX-2)];
+    }
+
+    // corners: copy nearest interior corner
+    T[0] = T[1*NX + 1];
+    T[NX-1] = T[1*NX + (NX-2)];
+    T[(NY-1)*NX] = T[(NY-2)*NX + 1];
+    T[(NY-1)*NX + (NX-1)] = T[(NY-2)*NX + (NX-2)];
+    return;
+  }
+
+  // BC_MIXED:
+  // left/right cold; top/bottom insulated.
+  for (INT32 j = 0; j < NY; j++) {
+    T[j*NX + 0] = 0.0f;
+    T[j*NX + (NX-1)] = 0.0f;
+  }
+
+  // top/bottom insulated (skip corners)
+  for (INT32 i = 1; i < NX-1; i++) {
+    T[0*NX + i]      = T[1*NX + i];
+    T[(NY-1)*NX + i] = T[(NY-2)*NX + i];
+  }
+
+  // corners explicitly cold
+  T[0] = 0.0f;
+  T[NX-1] = 0.0f;
+  T[(NY-1)*NX] = 0.0f;
+  T[(NY-1)*NX + (NX-1)] = 0.0f;
+}
+
+STATIC
+VOID
+StampDisk(float *T, INT32 NX, INT32 NY, INT32 cx, INT32 cy, INT32 rad, float val)
+{
+  INT32 r2 = rad * rad;
+
+  INT32 y0 = ClampI32(cy - rad, 0, NY-1);
+  INT32 y1 = ClampI32(cy + rad, 0, NY-1);
+  INT32 x0 = ClampI32(cx - rad, 0, NX-1);
+  INT32 x1 = ClampI32(cx + rad, 0, NX-1);
+
+  for (INT32 j = y0; j <= y1; j++) {
+    INT32 dy = j - cy;
+    for (INT32 i = x0; i <= x1; i++) {
+      INT32 dx = i - cx;
+      if (dx*dx + dy*dy <= r2) {
+        float *p = &T[j*NX + i];
+        if (val > *p) *p = val; // max-stamp
+      }
+    }
+  }
+}
+
+STATIC
+VOID
+DrawRect(UINT32 *Fb, UINTN Width, UINTN Height, UINTN Ppsl,
+         UINTN x0, UINTN y0, UINTN w, UINTN h, UINT32 px)
+{
+  if (x0 >= Width || y0 >= Height) return;
+
+  UINTN x1 = x0 + w; if (x1 > Width) x1 = Width;
+  UINTN y1 = y0 + h; if (y1 > Height) y1 = Height;
+
+  for (UINTN y = y0; y < y1; y++) {
+    UINT32 *row = Fb + y * Ppsl;
+    for (UINTN x = x0; x < x1; x++) {
+      row[x] = px;
+    }
+  }
+}
+
+STATIC
+VOID
+DrawCursor(UINT32 *Fb, UINTN Width, UINTN Height, UINTN Ppsl,
+           UINTN x, UINTN y, const PIXEL_PACKER *Packer)
+{
+  UINT32 w = PackPixel(Packer, 255, 255, 255);
+  DrawRect(Fb, Width, Height, Ppsl, (x > 2 ? x - 2 : 0), y, 5, 1, w);
+  DrawRect(Fb, Width, Height, Ppsl, x, (y > 2 ? y - 2 : 0), 1, 5, w);
+}
+
+// -------------------- Minimal 8x8 font for footer --------------------
+// Glyphs are 8 bytes (rows), MSB is left pixel.
+typedef struct {
+  CHAR8 Ch;
+  UINT8 Row[8];
+} GLYPH8;
+
+STATIC CONST GLYPH8 gFont8[] = {
+  {' ', {0,0,0,0,0,0,0,0}},
+  {'-', {0,0,0,0x7E,0,0,0,0}},
+  {',', {0,0,0,0,0,0x18,0x18,0x30}},
+  {'.', {0,0,0,0,0,0x18,0x18,0}},
+  {':', {0,0x18,0x18,0,0,0x18,0x18,0}},
+
+  // Digits
+  {'0', {0x3C,0x66,0x6E,0x76,0x66,0x66,0x3C,0}},
+  {'1', {0x18,0x38,0x18,0x18,0x18,0x18,0x3C,0}},
+  {'2', {0x3C,0x66,0x06,0x0C,0x18,0x30,0x7E,0}},
+  {'3', {0x3C,0x66,0x06,0x1C,0x06,0x66,0x3C,0}},
+  {'4', {0x0C,0x1C,0x3C,0x6C,0x7E,0x0C,0x0C,0}},
+  {'5', {0x7E,0x60,0x7C,0x06,0x06,0x66,0x3C,0}},
+  {'6', {0x1C,0x30,0x60,0x7C,0x66,0x66,0x3C,0}},
+  {'7', {0x7E,0x06,0x0C,0x18,0x30,0x30,0x30,0}},
+  {'8', {0x3C,0x66,0x66,0x3C,0x66,0x66,0x3C,0}},
+  {'9', {0x3C,0x66,0x66,0x3E,0x06,0x0C,0x38,0}},
+
+  // Uppercase letters (A-Z)
+  {'A', {0x18,0x3C,0x66,0x66,0x7E,0x66,0x66,0}},
+  {'B', {0x7C,0x66,0x66,0x7C,0x66,0x66,0x7C,0}},
+  {'C', {0x3C,0x66,0x60,0x60,0x60,0x66,0x3C,0}},
+  {'D', {0x78,0x6C,0x66,0x66,0x66,0x6C,0x78,0}},
+  {'E', {0x7E,0x60,0x60,0x7C,0x60,0x60,0x7E,0}},
+  {'F', {0x7E,0x60,0x60,0x7C,0x60,0x60,0x60,0}},
+  {'G', {0x3C,0x66,0x60,0x6E,0x66,0x66,0x3C,0}},
+  {'H', {0x66,0x66,0x66,0x7E,0x66,0x66,0x66,0}},
+  {'I', {0x3C,0x18,0x18,0x18,0x18,0x18,0x3C,0}},
+  {'J', {0x1E,0x0C,0x0C,0x0C,0x0C,0x6C,0x38,0}},
+  {'K', {0x66,0x6C,0x78,0x70,0x78,0x6C,0x66,0}},
+  {'L', {0x60,0x60,0x60,0x60,0x60,0x60,0x7E,0}},
+  {'M', {0x63,0x77,0x7F,0x6B,0x63,0x63,0x63,0}},
+  {'N', {0x66,0x76,0x7E,0x7E,0x6E,0x66,0x66,0}},
+  {'O', {0x3C,0x66,0x66,0x66,0x66,0x66,0x3C,0}},
+  {'P', {0x7C,0x66,0x66,0x7C,0x60,0x60,0x60,0}},
+  {'Q', {0x3C,0x66,0x66,0x66,0x6E,0x3C,0x0E,0}},
+  {'R', {0x7C,0x66,0x66,0x7C,0x78,0x6C,0x66,0}},
+  {'S', {0x3C,0x66,0x60,0x3C,0x06,0x66,0x3C,0}},
+  {'T', {0x7E,0x18,0x18,0x18,0x18,0x18,0x18,0}},
+  {'U', {0x66,0x66,0x66,0x66,0x66,0x66,0x3C,0}},
+  {'V', {0x66,0x66,0x66,0x66,0x66,0x3C,0x18,0}},
+  {'W', {0x63,0x63,0x63,0x6B,0x7F,0x77,0x63,0}},
+  {'X', {0x66,0x66,0x3C,0x18,0x3C,0x66,0x66,0}},
+  {'Y', {0x66,0x66,0x66,0x3C,0x18,0x18,0x18,0}},
+  {'Z', {0x7E,0x06,0x0C,0x18,0x30,0x60,0x7E,0}},
+
+  {'?', {0x3C,0x66,0x06,0x0C,0x18,0x00,0x18,0}},
+};
+
+STATIC
+CONST UINT8*
+FindGlyph8(CHAR8 ch)
+{
+  for (UINTN i = 0; i < (sizeof(gFont8)/sizeof(gFont8[0])); i++) {
+    if (gFont8[i].Ch == ch) return gFont8[i].Row;
+  }
+  // fallback '?'
+  for (UINTN i = 0; i < (sizeof(gFont8)/sizeof(gFont8[0])); i++) {
+    if (gFont8[i].Ch == '?') return gFont8[i].Row;
+  }
+  return gFont8[0].Row;
+}
+
+STATIC
+VOID
+DrawChar8(UINT32 *Fb, UINTN Width, UINTN Height, UINTN Ppsl,
+          UINTN x, UINTN y, CHAR8 ch, UINT32 fg, UINT32 bg, BOOLEAN OpaqueBg)
+{
+  // Allow lowercase by mapping to uppercase
+  if (ch >= 'a' && ch <= 'z') {
+    ch = (CHAR8)(ch - 'a' + 'A');
+  }
+
+  CONST UINT8 *rows = FindGlyph8(ch);
+
+  for (UINTN ry = 0; ry < 8; ry++) {
+    UINTN py = y + ry;
+    if (py >= Height) break;
+    UINT8 bits = rows[ry];
+    UINT32 *row = Fb + py * Ppsl;
+    for (UINTN rx = 0; rx < 8; rx++) {
+      UINTN px = x + rx;
+      if (px >= Width) break;
+      BOOLEAN on = ((bits & (0x80u >> rx)) != 0);
+      if (on) row[px] = fg;
+      else if (OpaqueBg) row[px] = bg;
+    }
+  }
+}
+
+STATIC
+VOID
+DrawString8(UINT32 *Fb, UINTN Width, UINTN Height, UINTN Ppsl,
+            UINTN x, UINTN y, CONST CHAR8 *s, UINT32 fg, UINT32 bg, BOOLEAN OpaqueBg)
+{
+  UINTN cx = x;
+  for (; *s; s++) {
+    if (*s == '\n') { y += 10; cx = x; continue; }
+    DrawChar8(Fb, Width, Height, Ppsl, cx, y, *s, fg, bg, OpaqueBg);
+    cx += 8;
+  }
+}
+
+STATIC
+VOID
+DrawFooter(UINT32 *Fb, UINTN Width, UINTN Height, UINTN Ppsl, const PIXEL_PACKER *Packer)
+{
+  CONST CHAR8 *msg = "Dec 27, 2025 - Bare Metal Parabolic PDE Solver";
+
+  // Footer strip
+  UINTN padX = 12;
+  UINTN padY = 6;
+  UINTN textH = 8;
+  UINTN boxH = textH + padY * 2;
+
+  if (Height < boxH + 2) return;
+
+  UINTN y0 = Height - boxH;
+
+  UINT32 bg = PackPixel(Packer, 10, 10, 10);
+  UINT32 fg = PackPixel(Packer, 240, 240, 240);
+
+  DrawRect(Fb, Width, Height, Ppsl, 0, y0, Width, boxH, bg);
+  DrawString8(Fb, Width, Height, Ppsl, padX, y0 + padY, msg, fg, bg, FALSE);
+}
+
+typedef struct {
+  BOOLEAN HasAbs;
+  BOOLEAN HasRel;
+
+  EFI_ABSOLUTE_POINTER_PROTOCOL *Abs;
+  EFI_SIMPLE_POINTER_PROTOCOL   *Rel;
+
+  // cursor in screen pixels
+  INT32 X;
+  INT32 Y;
+
+  // abs ranges
+  INT32 AbsMinX, AbsMaxX;
+  INT32 AbsMinY, AbsMaxY;
+
+  // last absolute mapped position (for "absMoved" detection)
+  BOOLEAN LastAbsValid;
+  INT32   LastAbsX;
+  INT32   LastAbsY;
+
+  // rel scaling
+  INT32 RelScale; // bigger = slower
+} POINTER_STATE;
+
+STATIC
+VOID
+InitPointer(POINTER_STATE *P, EFI_SYSTEM_TABLE *SystemTable, UINTN Width, UINTN Height)
+{
+  SetMem(P, sizeof(*P), 0);
+
+  P->RelScale = 8;
+  P->X = (INT32)(Width / 2);
+  P->Y = (INT32)(Height / 2);
+
+  EFI_STATUS st;
+
+  st = gBS->LocateProtocol(&gEfiAbsolutePointerProtocolGuid, NULL, (VOID**)&P->Abs);
+  if (!EFI_ERROR(st) && P->Abs) {
+    P->HasAbs = TRUE;
+    EFI_ABSOLUTE_POINTER_MODE *M = P->Abs->Mode;
+    P->AbsMinX = (INT32)M->AbsoluteMinX;
+    P->AbsMaxX = (INT32)M->AbsoluteMaxX;
+    P->AbsMinY = (INT32)M->AbsoluteMinY;
+    P->AbsMaxY = (INT32)M->AbsoluteMaxY;
+  }
+
+  st = gBS->LocateProtocol(&gEfiSimplePointerProtocolGuid, NULL, (VOID**)&P->Rel);
+  if (!EFI_ERROR(st) && P->Rel) {
+    P->HasRel = TRUE;
+  }
+
+  // Reset console input to avoid stale keystrokes
+  SystemTable->ConIn->Reset(SystemTable->ConIn, FALSE);
+}
+
+STATIC
+BOOLEAN
+PollPointer(POINTER_STATE *P, UINTN Width, UINTN Height, BOOLEAN *OutPressed)
+{
+  BOOLEAN absAvail = FALSE;
+  BOOLEAN absPressed = FALSE;
+  BOOLEAN absMoved = FALSE;
+  INT32 absX = P->X;
+  INT32 absY = P->Y;
+
+  BOOLEAN relAvail = FALSE;
+  BOOLEAN relPressed = FALSE;
+  BOOLEAN relMoved = FALSE;
+  INT32 dx = 0;
+  INT32 dy = 0;
+
+  // --- Absolute pointer read ---
+  if (P->HasAbs && P->Abs) {
+    EFI_ABSOLUTE_POINTER_STATE st;
+    EFI_STATUS e = P->Abs->GetState(P->Abs, &st);
+    if (!EFI_ERROR(e)) {
+      absAvail = TRUE;
+
+      INT32 ax = (INT32)st.CurrentX;
+      INT32 ay = (INT32)st.CurrentY;
+
+      INT32 rx = P->AbsMaxX - P->AbsMinX;
+      INT32 ry = P->AbsMaxY - P->AbsMinY;
+      if (rx <= 0) rx = 1;
+      if (ry <= 0) ry = 1;
+
+      // Map absolute range to [0..Width-1], [0..Height-1]
+      absX = (INT32)((((INT64)(ax - P->AbsMinX)) * (INT64)((Width  > 0) ? (Width  - 1) : 0)) / rx);
+      absY = (INT32)((((INT64)(ay - P->AbsMinY)) * (INT64)((Height > 0) ? (Height - 1) : 0)) / ry);
+
+      absX = ClampI32(absX, 0, (INT32)Width  - 1);
+      absY = ClampI32(absY, 0, (INT32)Height - 1);
+
+      absPressed = (st.ActiveButtons != 0);
+
+      if (!P->LastAbsValid || absX != P->LastAbsX || absY != P->LastAbsY) {
+        absMoved = TRUE;
+      }
+      P->LastAbsValid = TRUE;
+      P->LastAbsX = absX;
+      P->LastAbsY = absY;
+    }
+  }
+
+  // --- Relative pointer read ---
+  if (P->HasRel && P->Rel) {
+    EFI_SIMPLE_POINTER_STATE st;
+    EFI_STATUS e = P->Rel->GetState(P->Rel, &st);
+    if (!EFI_ERROR(e)) {
+      relAvail = TRUE;
+
+      dx = (INT32)(st.RelativeMovementX / P->RelScale);
+      dy = (INT32)(st.RelativeMovementY / P->RelScale);
+      relMoved = (dx != 0 || dy != 0);
+
+      relPressed = (st.LeftButton != 0);
+    }
+  }
+
+  BOOLEAN pressed = absPressed || relPressed;
+  BOOLEAN moved = FALSE;
+
+  if (absAvail && absPressed) {
+    // Touch active: absolute wins
+    moved = (absX != P->X) || (absY != P->Y);
+    P->X = absX;
+    P->Y = absY;
+  } else {
+    if (relAvail && relMoved) {
+      // Mouse moved: apply delta
+      INT32 nx = ClampI32(P->X + dx, 0, (INT32)Width  - 1);
+      INT32 ny = ClampI32(P->Y + dy, 0, (INT32)Height - 1);
+      moved = (nx != P->X) || (ny != P->Y);
+      P->X = nx;
+      P->Y = ny;
+    } else if (absAvail && absMoved) {
+      // No mouse movement; allow absolute motion to move cursor
+      moved = (absX != P->X) || (absY != P->Y);
+      P->X = absX;
+      P->Y = absY;
+    }
+  }
+
+  *OutPressed = pressed;
+  return moved || pressed;
+}
+
+EFI_STATUS
+EFIAPI
+UefiMain(IN EFI_HANDLE ImageHandle, IN EFI_SYSTEM_TABLE *SystemTable)
+{
+  EFI_STATUS Status;
+  EFI_GRAPHICS_OUTPUT_PROTOCOL *Gop = NULL;
+
+  Status = gBS->LocateProtocol(&gEfiGraphicsOutputProtocolGuid, NULL, (VOID**)&Gop);
+  if (EFI_ERROR(Status) || Gop == NULL) {
+    Print(L"GOP not available: %r\n", Status);
+    return Status;
+  }
+
+  EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *Info = Gop->Mode->Info;
+  UINTN  Width  = Info->HorizontalResolution;
+  UINTN  Height = Info->VerticalResolution;
+  UINTN  Ppsl   = Info->PixelsPerScanLine;
+
+  if (Width == 0 || Height == 0 || Ppsl == 0) {
+    Print(L"Invalid GOP mode information.\n");
+    return EFI_UNSUPPORTED;
+  }
+
+  // Initialize pixel packer + validate pixel format
+  PIXEL_PACKER Packer;
+  Packer.Fmt = Info->PixelFormat;
+
+  if (Packer.Fmt == PixelBltOnly) {
+    Print(L"Error: GOP PixelFormat is PixelBltOnly.\n");
+    Print(L"This demo requires direct framebuffer access.\n");
+    return EFI_UNSUPPORTED;
+  }
+  if (Packer.Fmt == PixelBitMask) {
+    Packer.Masks = Info->PixelInformation;
+  } else {
+    SetMem(&Packer.Masks, sizeof(Packer.Masks), 0);
+  }
+
+  UINT32 *Fb = (UINT32*)(UINTN)Gop->Mode->FrameBufferBase;
+
+  Print(L"Heat2D UEFI\n");
+  Print(L"Resolution: %ux%u, PixelsPerScanLine=%u, PixelFormat=%u\n", Width, Height, Ppsl, (UINT32)Packer.Fmt);
+  Print(L"Keys: Esc quit | Space pause | R reset | B boundary | C clear\n");
+  Print(L"Brush: +/- size | 1/2/3 temp | Click/drag paint\n");
+
+  // ---- Simulation grid ----
+  const INT32 NX = 240;
+  const INT32 NY = 240;
+
+  float *A = AllocateZeroPool(sizeof(float) * NX * NY);
+  float *B = AllocateZeroPool(sizeof(float) * NX * NY);
+  if (!A || !B) {
+    Print(L"Out of memory\n");
+    if (A) FreePool(A);
+    if (B) FreePool(B);
+    return EFI_OUT_OF_RESOURCES;
+  }
+
+  // Stability guide: r <= 0.25 for 2D explicit diffusion.
+  const float r = 0.20f;
+
+  // Fixed heat sources
+  const INT32 baseCx  = NX / 2,       baseCy  = NY / 2;
+  const INT32 baseRad = NX / 14;
+  const float baseTemp = 1.0f;
+
+  const INT32 src1Cx  = NX / 4,        src1Cy  = NY / 3;
+  const INT32 src2Cx  = (3 * NX) / 4,  src2Cy  = (2 * NY) / 3;
+  const INT32 src1Rad = NX / 18;
+  const INT32 src2Rad = NX / 20;
+  const float src1Temp = 0.85f;
+  const float src2Temp = 0.70f;
+
+  // User brush
+  INT32 brushRad = NX / 30;
+  float brushTemp = 1.0f;
+
+  BOUNDARY_MODE bc = BC_DIRICHLET_COLD;
+  BOOLEAN Paused = FALSE;
+
+  // ---- Rendering scaling ----
+  UINTN cellW = Width / NX;
+  UINTN cellH = Height / NY;
+  if (cellW < 1) cellW = 1;
+  if (cellH < 1) cellH = 1;
+
+  // Performance knob: subsample on large displays
+  UINTN drawSkip = 1;
+  if (Width * Height > 1920u * 1080u) drawSkip = 2;
+
+  UINTN drawW = (UINTN)NX * cellW;
+  UINTN drawH = (UINTN)NY * cellH;
+  if (drawW > Width)  drawW = Width;
+  if (drawH > Height) drawH = Height;
+
+  POINTER_STATE Ptr;
+  InitPointer(&Ptr, SystemTable, Width, Height);
+
+  // Clear background once
+  UINT32 bg = PackPixel(&Packer, 0, 0, 0);
+  DrawRect(Fb, Width, Height, Ppsl, 0, 0, Width, Height, bg);
+
+  BOOLEAN dirty = TRUE;
+
+  while (TRUE) {
+    // ---- Keyboard ----
+    EFI_INPUT_KEY Key;
+    while (TryReadKey(SystemTable, &Key)) {
+      if (Key.ScanCode == SCAN_ESC) goto done;
+
+      if (Key.UnicodeChar == L' ') {
+        Paused = !Paused;
+        dirty = TRUE;
+      } else if (Key.UnicodeChar == L'r' || Key.UnicodeChar == L'R') {
+        SetMem(A, sizeof(float)*NX*NY, 0);
+        SetMem(B, sizeof(float)*NX*NY, 0);
+        dirty = TRUE;
+      } else if (Key.UnicodeChar == L'c' || Key.UnicodeChar == L'C') {
+        SetMem(A, sizeof(float)*NX*NY, 0);
+        dirty = TRUE;
+      } else if (Key.UnicodeChar == L'b' || Key.UnicodeChar == L'B') {
+        bc = (BOUNDARY_MODE)((bc + 1) % BC_COUNT);
+        dirty = TRUE;
+      } else if (Key.UnicodeChar == L'+' || Key.UnicodeChar == L'=') {
+        brushRad = ClampI32(brushRad + 2, 2, NX/4);
+        dirty = TRUE;
+      } else if (Key.UnicodeChar == L'-' || Key.UnicodeChar == L'_') {
+        brushRad = ClampI32(brushRad - 2, 2, NX/4);
+        dirty = TRUE;
+      } else if (Key.UnicodeChar == L'1') {
+        brushTemp = 0.5f; dirty = TRUE;
+      } else if (Key.UnicodeChar == L'2') {
+        brushTemp = 0.8f; dirty = TRUE;
+      } else if (Key.UnicodeChar == L'3') {
+        brushTemp = 1.0f; dirty = TRUE;
+      }
+    }
+
+    // ---- Pointer ----
+    BOOLEAN pressed = FALSE;
+    BOOLEAN ptrEvent = PollPointer(&Ptr, Width, Height, &pressed);
+
+    // Map cursor pixel -> grid cell (use drawW/drawH region)
+    INT32 gx = (INT32)((((INT64)Ptr.X) * NX) / (INT32)((drawW > 0) ? drawW : 1));
+    INT32 gy = (INT32)((((INT64)Ptr.Y) * NY) / (INT32)((drawH > 0) ? drawH : 1));
+    gx = ClampI32(gx, 0, NX-1);
+    gy = ClampI32(gy, 0, NY-1);
+
+    if (pressed) {
+      StampDisk(A, NX, NY, gx, gy, brushRad, brushTemp);
+      dirty = TRUE;
+    } else if (ptrEvent) {
+      dirty = TRUE; // cursor moved
+    }
+
+    // ---- Simulation ----
+    if (!Paused) {
+      // Re-stamp fixed heat each step
+      StampDisk(A, NX, NY, baseCx, baseCy, baseRad, baseTemp);
+      StampDisk(A, NX, NY, src1Cx, src1Cy, src1Rad, src1Temp);
+      StampDisk(A, NX, NY, src2Cx, src2Cy, src2Rad, src2Temp);
+
+      // Explicit diffusion step
+      for (INT32 j = 1; j < NY-1; j++) {
+        for (INT32 i = 1; i < NX-1; i++) {
+          float t = A[j*NX + i];
+          float lap =
+            A[j*NX + (i+1)] + A[j*NX + (i-1)] +
+            A[(j+1)*NX + i] + A[(j-1)*NX + i] - 4.0f*t;
+          B[j*NX + i] = t + r * lap;
+        }
+      }
+
+      ApplyBoundary(B, NX, NY, bc);
+
+      // Swap buffers
+      float *Tmp = A; A = B; B = Tmp;
+      dirty = TRUE;
+    }
+
+    // ---- Render ----
+    if (dirty) {
+      // Draw heat field
+      for (INT32 j = 0; j < NY; j += (INT32)drawSkip) {
+        for (INT32 i = 0; i < NX; i += (INT32)drawSkip) {
+          float t = A[j*NX + i];
+
+          UINT8 rr, gg, bb;
+          TempToRGB(t, &rr, &gg, &bb);
+
+          UINT32 px = PackPixel(&Packer, rr, gg, bb);
+
+          UINTN x0 = (UINTN)i * cellW;
+          UINTN y0 = (UINTN)j * cellH;
+
+          UINTN cw = cellW * drawSkip;
+          UINTN ch = cellH * drawSkip;
+          if (cw < 1) cw = 1;
+          if (ch < 1) ch = 1;
+
+          if (x0 >= drawW || y0 >= drawH) continue;
+
+          DrawRect(Fb, Width, Height, Ppsl, x0, y0, cw, ch, px);
+        }
+      }
+
+      // Cursor first (footer should stay clean)
+      DrawCursor(Fb, Width, Height, Ppsl, (UINTN)Ptr.X, (UINTN)Ptr.Y, &Packer);
+
+      // Footer last
+      DrawFooter(Fb, Width, Height, Ppsl, &Packer);
+
+      dirty = FALSE;
+    }
+
+    // Throttle (microseconds)
+    gBS->Stall(4000); // ~4ms
+  }
+
+done:
+  FreePool(A);
+  FreePool(B);
+  Print(L"Exit.\n");
+  return EFI_SUCCESS;
+}

@@ -1,0 +1,29 @@
+[Defines]
+  INF_VERSION                    = 0x0001001A
+  BASE_NAME                      = Heat2D
+  FILE_GUID                      = 9A2DBA29-5D2E-4F58-8CC3-4D0D6D0D3F8C
+  MODULE_TYPE                    = UEFI_APPLICATION
+  VERSION_STRING                 = 2.2
+  ENTRY_POINT                    = UefiMain
+
+[Sources]
+  Heat2D.c
+  MemCWrappers.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+  MdeModulePkg/MdeModulePkg.dec
+
+[LibraryClasses]
+  UefiApplicationEntryPoint
+  UefiLib
+  UefiBootServicesTableLib
+  MemoryAllocationLib
+  BaseMemoryLib
+  PrintLib
+
+[Protocols]
+  gEfiGraphicsOutputProtocolGuid
+  gEfiSimplePointerProtocolGuid
+  gEfiAbsolutePointerProtocolGuid
+
