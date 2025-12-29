@@ -121,8 +121,7 @@ STATIC VOID BuildViridisLikeLut(VOID) {
     float u = (t1 > t0) ? ((t - t0) / (t1 - t0)) : 0.0f;
     if (u < 0) {
       u = 0;
-    }
-    if (u > 1) {
+    } else if (u > 1) {
       u = 1;
     }
     gColorLut[i].r = LerpU8(stops[k].r, stops[k+1].r, u);
@@ -641,11 +640,11 @@ EFI_STATUS EFIAPI UefiMain(IN EFI_HANDLE ImageHandle, IN EFI_SYSTEM_TABLE *Syste
 
   if (!A || !B || !Kcell || !Kx || !Ky || !Mat) {
     Print(L"Out of memory\n");
-    if (A) FreePool(A); 
-    if (B) {FreePool(B);}
-    if (Kcell) {FreePool(Kcell);}
-    if (Kx) {FreePool(Kx);}
-    if (Ky) {FreePool(Ky);}
+    if (A) FreePool(A);
+    if (B) FreePool(B);
+    if (Kcell) FreePool(Kcell);
+    if (Kx) FreePool(Kx);
+    if (Ky) FreePool(Ky);
 
     if (Mat) FreePool(Mat);
     return EFI_OUT_OF_RESOURCES;

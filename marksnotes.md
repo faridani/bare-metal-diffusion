@@ -1,12 +1,17 @@
-I installed an Ubuntu on a virtual box on a windows 
+These instructions are for building the project on an Ubuntu-based system (including WSL or a VM).
 
-Then inside Ubuntu 
+## Prerequisites
+
+Install the required packages:
 
 ```bash
 sudo apt update
-sudo apt install -y build-essential git python3 \
+sudo apt install -y \
+  build-essential git python3 \
   gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-  nasm iasl uuid-dev
+  nasm iasl uuid-dev \
+  qemu-system-aarch64 qemu-efi-aarch64 \
+  mtools dosfstools
 ```
 
 ## Build instructions (EDK2)
@@ -21,40 +26,28 @@ cd edk2
 git submodule update --init --recursive
 ```
 
-```bash 
+### 2) Add the Heat2D application to the EDK2 workspace
+
+```bash
 cd ..
 git clone https://github.com/faridani/uefi-2D-heat-diffusion.git
 mv ./uefi-2D-heat-diffusion ./edk2/Heat2D
+```
 
-
-### 2) Build BaseTools and set up the environment
+### 3) Build BaseTools and set up the environment
 
 ```bash
+cd edk2
 make -C BaseTools
 . edksetup.sh
 ```
 
-# Now build 
+### 4) Build the UEFI application (DEBUG)
 
 ```bash
-sudo apt update
-sudo apt install gcc-aarch64-linux-gnu g++-aarch64-linux-gnu make uuid-dev 
-sudo apt install -y qemu-system-arm qemu-system-aarch64 qemu-efi-aarch64 mtools dosfstools
+build -a AARCH64 -t GCC5 -b DEBUG -p Heat2D/Heat2D.dsc
 ```
 
+The output EFI will be located at `Build/Heat2DPlatform/DEBUG_GCC5/AARCH64/Heat2D.efi`.
 
-
-NOW BUILD 
-
-# ====== 2) Build your UEFI app (DEBUG) ======
-build -a AARCH64 -t GCC5 -b DEBUG -p Heat2D/Heat2D.dsc
-
-# Your output EFI will be here:
-# Build/Heat2DPlatform/DEBUG_GCC5/AARCH64/Heat2D.efi
-
-From this point on you should be able to run the rest of 
-Head2D.sh and see the code 
-
-
-
-
+From this point on you can run the remaining steps in `Heat2D.sh` to test the code.
