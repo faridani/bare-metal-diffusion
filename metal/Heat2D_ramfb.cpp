@@ -1,117 +1,89 @@
-// Heat2D_ramfb.cpp
-// Bare-metal Heat2D demo for QEMU aarch64: -M virt
+// Heat2D_ramfb.cpp - Bare-metal Heat2D for QEMU AArch64 "virt" using ramfb + fw_cfg DMA
+//
+// Why this works:
+//  - ramfb must be configured by writing a *packed 28-byte* RAMFBCfg to fw_cfg file "etc/ramfb" via DMA
+//  - fw_cfg DMA is big-endian, so control/len/addr and the RAMFBCfg fields must be byte-swapped
+//  - After a successful write, the framebuffer appears and QEMU display becomes "active"
+//
+// References:
+//  - OSDev ramfb notes the struct and DMA usage 
+//  - QEMU fw_cfg DMA is big-endian 
 
 #include <stdint.h>
 #include <stddef.h>
 
-extern "C" void kmain(void);
+extern "C" char __bss_end__[];
 
-// ------------------------------------------------------------
-// Small helpers (no libc)
-// ------------------------------------------------------------
-static inline void dmb_sy() { asm volatile("dmb sy" ::: "memory"); }
-static inline void dsb_sy() { asm volatile("dsb sy" ::: "memory"); }
-static inline void isb()    { asm volatile("isb" ::: "memory"); }
-static inline void wfe()    { asm volatile("wfe"); }
-
-static inline uint16_t bswap16(uint16_t v) { return __builtin_bswap16(v); }
-static inline uint32_t bswap32(uint32_t v) { return __builtin_bswap32(v); }
-static inline uint64_t bswap64(uint64_t v) { return __builtin_bswap64(v); }
-
-static inline uint16_t cpu_to_be16(uint16_t v) { return bswap16(v); }
-static inline uint32_t cpu_to_be32(uint32_t v) { return bswap32(v); }
-static inline uint64_t cpu_to_be64(uint64_t v) { return bswap64(v); }
-static inline uint16_t be16_to_cpu(uint16_t v) { return bswap16(v); }
-static inline uint32_t be32_to_cpu(uint32_t v) { return bswap32(v); }
-static inline uint64_t be64_to_cpu(uint64_t v) { return bswap64(v); }
+/* ------------------------- tiny libc ------------------------- */
+extern "C" void* memset(void* dst, int v, size_t n) {
+    uint8_t* p = (uint8_t*)dst;
+    while (n--) *p++ = (uint8_t)v;
+    return dst;
+}
 
 extern "C" void* memcpy(void* dst, const void* src, size_t n) {
-    auto* d = (uint8_t*)dst;
-    auto* s = (const uint8_t*)src;
-    for (size_t i = 0; i < n; ++i) d[i] = s[i];
-    return dst;
-}
-extern "C" void* memset(void* dst, int c, size_t n) {
-    auto* d = (uint8_t*)dst;
-    for (size_t i = 0; i < n; ++i) d[i] = (uint8_t)c;
+    uint8_t* d = (uint8_t*)dst;
+    const uint8_t* s = (const uint8_t*)src;
+    while (n--) *d++ = *s++;
     return dst;
 }
 
-// ------------------------------------------------------------
-// PL011 UART @ 0x09000000 (QEMU virt)
-// ------------------------------------------------------------
-static constexpr uintptr_t UART_BASE = 0x09000000UL;
+static size_t c_strlen(const char* s) {
+    size_t n = 0;
+    while (s && s[n]) n++;
+    return n;
+}
 
-static inline void mmio_w32(uintptr_t addr, uint32_t v) {
+/* ------------------------- MMIO helpers ------------------------- */
+static inline uint16_t bswap16(uint16_t x) { return __builtin_bswap16(x); }
+static inline uint32_t bswap32(uint32_t x) { return __builtin_bswap32(x); }
+static inline uint64_t bswap64(uint64_t x) { return __builtin_bswap64(x); }
+
+static inline void mmio_write32(uintptr_t addr, uint32_t v) {
     *(volatile uint32_t*)addr = v;
 }
-static inline uint32_t mmio_r32(uintptr_t addr) {
+static inline uint32_t mmio_read32(uintptr_t addr) {
     return *(volatile uint32_t*)addr;
 }
 
-static void uart_init() {
-    constexpr uintptr_t IBRD = UART_BASE + 0x24;
-    constexpr uintptr_t FBRD = UART_BASE + 0x28;
-    constexpr uintptr_t LCRH = UART_BASE + 0x2C;
-    constexpr uintptr_t CR   = UART_BASE + 0x30;
-    constexpr uintptr_t ICR  = UART_BASE + 0x44;
-
-    mmio_w32(CR, 0x0);
-    mmio_w32(ICR, 0x7FF);
-    mmio_w32(IBRD, 13);
-    mmio_w32(FBRD, 2);
-    mmio_w32(LCRH, (3u << 5) | (1u << 4));
-    mmio_w32(CR, (1u << 0) | (1u << 8) | (1u << 9));
+static inline void mmio_write32be(uintptr_t addr, uint32_t v) {
+    *(volatile uint32_t*)addr = bswap32(v);
 }
 
-static void uart_putc(char c) {
-    constexpr uintptr_t DR = UART_BASE + 0x00;
-    constexpr uintptr_t FR = UART_BASE + 0x18;
-    constexpr uint32_t TXFF = (1u << 5);
+static inline void dsb_sy() { asm volatile("dsb sy" ::: "memory"); }
+static inline void isb()    { asm volatile("isb" ::: "memory"); }
 
-    if (c == '\n') uart_putc('\r');
-    while (mmio_r32(FR) & TXFF) { /* wait */ }
-    mmio_w32(DR, (uint32_t)c);
-}
+/* ------------------------- PL011 UART (virt) ------------------------- */
+static constexpr uintptr_t UART_BASE = 0x09000000UL;
 
-static void uart_flush() {
-    // Wait for UART TX to be idle (BUSY flag clear)
-    constexpr uintptr_t FR = UART_BASE + 0x18;
-    constexpr uint32_t BUSY = (1u << 3);
-    while (mmio_r32(FR) & BUSY) { /* wait */ }
+static inline void uart_putc(char c) {
+    // PL011 FR TXFF (bit 5): 1 = TX FIFO full
+    while (mmio_read32(UART_BASE + 0x18) & (1u << 5)) { }
+    mmio_write32(UART_BASE + 0x00, (uint32_t)c);
 }
 
 static void uart_puts(const char* s) {
-    while (*s) uart_putc(*s++);
-    uart_flush();
+    if (!s) return;
+    while (*s) {
+        char c = *s++;
+        if (c == '\n') uart_putc('\r');
+        uart_putc(c);
+    }
 }
 
-static void uart_puthex_u8(uint8_t v) {
-    static const char* hexd = "0123456789abcdef";
-    uart_putc(hexd[(v >> 4) & 0xF]);
-    uart_putc(hexd[v & 0xF]);
+static void uart_hex64(uint64_t v) {
+    static const char* hex = "0123456789abcdef";
+    uart_puts("0x");
+    for (int i = 60; i >= 0; i -= 4) {
+        uart_putc(hex[(v >> i) & 0xF]);
+    }
 }
 
-static void uart_puthex_u32(uint32_t v) {
-    static const char* hexd = "0123456789abcdef";
-    for (int i = 7; i >= 0; --i) uart_putc(hexd[(v >> (i * 4)) & 0xF]);
+static void uart_hex32(uint32_t v) {
+    uart_hex64((uint64_t)v);
 }
 
-static void uart_puthex_u64(uint64_t v) {
-    static const char* hexd = "0123456789abcdef";
-    for (int i = 15; i >= 0; --i) uart_putc(hexd[(v >> (i * 4)) & 0xF]);
-}
-
-[[noreturn]] static void panic(const char* msg) {
-    uart_puts("\nPANIC: ");
-    uart_puts(msg);
-    uart_puts("\n");
-    for (;;) wfe();
-}
-
-// ------------------------------------------------------------
-// Generic timer (for delays)
-// ------------------------------------------------------------
+/* ------------------------- Generic timer delay ------------------------- */
 static inline uint64_t read_cntfrq_el0() {
     uint64_t v;
     asm volatile("mrs %0, cntfrq_el0" : "=r"(v));
@@ -123,67 +95,30 @@ static inline uint64_t read_cntpct_el0() {
     return v;
 }
 static void delay_ms(uint32_t ms) {
-    const uint64_t freq = read_cntfrq_el0();
-    const uint64_t start = read_cntpct_el0();
-    const uint64_t ticks = (freq / 1000ULL) * (uint64_t)ms;
-    while ((read_cntpct_el0() - start) < ticks) { /* spin */ }
+    uint64_t freq = read_cntfrq_el0();
+    uint64_t start = read_cntpct_el0();
+    uint64_t ticks = (freq / 1000ULL) * (uint64_t)ms;
+    while ((read_cntpct_el0() - start) < ticks) { }
 }
 
-// ------------------------------------------------------------
-// fw_cfg interface
-// virt machine: base=0x09020000
-// - Selector register at +0x08 (16-bit BE write to select item)
-// - Data register at +0x00 (byte-by-byte read/write after select)
-// - DMA address at +0x10 (64-bit BE, triggers on write)
-// ------------------------------------------------------------
-static constexpr uintptr_t FW_CFG_BASE = 0x09020000UL;
-static constexpr uintptr_t FW_CFG_DATA = FW_CFG_BASE + 0x00;
-static constexpr uintptr_t FW_CFG_SEL  = FW_CFG_BASE + 0x08;
-static constexpr uintptr_t FW_CFG_DMA  = FW_CFG_BASE + 0x10;
+/* ------------------------- fw_cfg + DMA (virt) ------------------------- */
+static constexpr uintptr_t FW_CFG_BASE     = 0x09020000UL;
+static constexpr uintptr_t FW_CFG_DMA_ADDR = FW_CFG_BASE + 0x10;
 
 static constexpr uint16_t FW_CFG_FILE_DIR = 0x0019;
 
-static constexpr uint32_t FW_DMA_ERROR  = 1u << 0;
-static constexpr uint32_t FW_DMA_READ   = 1u << 1;
-static constexpr uint32_t FW_DMA_SKIP   = 1u << 2;
-static constexpr uint32_t FW_DMA_SELECT = 1u << 3;
-static constexpr uint32_t FW_DMA_WRITE  = 1u << 4;
+static constexpr uint32_t DMA_CTL_ERROR  = 0x01;
+static constexpr uint32_t DMA_CTL_READ   = 0x02;
+static constexpr uint32_t DMA_CTL_SKIP   = 0x04;
+static constexpr uint32_t DMA_CTL_SELECT = 0x08;
+static constexpr uint32_t DMA_CTL_WRITE  = 0x10;
 
-struct FWCfgDma {
-    uint32_t control;
-    uint32_t length;
-    uint64_t address;
-} __attribute__((packed, aligned(4096)));
-
-static FWCfgDma g_dma __attribute__((aligned(4096)));
-
-static void fwcfg_dma_wait() {
-    for (volatile int i = 0; i < 100000; ++i) {
-        dmb_sy();
-        uint32_t ctrl = be32_to_cpu(g_dma.control);
-        if (ctrl == 0) return;
-        if (ctrl & FW_DMA_ERROR) {
-            panic("fw_cfg DMA error");
-        }
-    }
-    panic("fw_cfg DMA timeout");
-}
-
-static void fwcfg_dma_transfer(uint32_t control, void* buf, uint32_t len) {
-    g_dma.control = cpu_to_be32(control);
-    g_dma.length  = cpu_to_be32(len);
-    g_dma.address = cpu_to_be64((uint64_t)(uintptr_t)buf);
-    
-    dsb_sy();
-    
-    uint64_t dma_addr = (uint64_t)(uintptr_t)&g_dma;
-    
-    // Write as single 64-bit big-endian value
-    *(volatile uint64_t*)FW_CFG_DMA = cpu_to_be64(dma_addr);
-    
-    dsb_sy();
-    fwcfg_dma_wait();
-}
+struct __attribute__((packed)) FWCfgDmaAccess {
+    uint32_t control_be;
+    uint32_t length_be;
+    uint64_t address_be;
+};
+static_assert(sizeof(FWCfgDmaAccess) == 16, "FWCfgDmaAccess must be 16 bytes");
 
 struct __attribute__((packed)) FWCfgFile {
     uint32_t size_be;
@@ -191,250 +126,320 @@ struct __attribute__((packed)) FWCfgFile {
     uint16_t reserved_be;
     char     name[56];
 };
+static_assert(sizeof(FWCfgFile) == 64, "FWCfgFile must be 64 bytes");
 
-static size_t my_strlen(const char* s) {
-    size_t len = 0;
-    while (s[len]) ++len;
-    return len;
+// IMPORTANT: must be packed => 28 bytes, not 32.
+struct __attribute__((packed)) RAMFBCfg {
+    uint64_t addr_be;
+    uint32_t fourcc_be;
+    uint32_t flags_be;
+    uint32_t width_be;
+    uint32_t height_be;
+    uint32_t stride_be;
+};
+static_assert(sizeof(RAMFBCfg) == 28, "RAMFBCfg must be 28 bytes");
+
+static volatile FWCfgDmaAccess g_dma __attribute__((aligned(16)));
+
+static void fw_cfg_dma_transfer(uint32_t control, void* buf, uint32_t len) {
+    g_dma.control_be = bswap32(control);
+    g_dma.length_be  = bswap32(len);
+    g_dma.address_be = bswap64((uint64_t)(uintptr_t)buf);
+
+    dsb_sy();
+
+    uint64_t desc_addr = (uint64_t)(uintptr_t)&g_dma;
+
+    // Per fw_cfg DMA spec: write high 32 then low 32 (low triggers)
+    mmio_write32be(FW_CFG_DMA_ADDR + 0, (uint32_t)(desc_addr >> 32));
+    mmio_write32be(FW_CFG_DMA_ADDR + 4, (uint32_t)(desc_addr & 0xFFFFFFFFu));
+
+    // Poll completion; QEMU clears control to 0, sets ERROR bit on failure
+    for (;;) {
+        uint32_t c = bswap32(g_dma.control_be);
+        if (c == 0) break;
+        if (c & DMA_CTL_ERROR) {
+            uart_puts("fw_cfg DMA ERROR, control=");
+            uart_hex32(c);
+            uart_puts("\nHALTING.\n");
+            while (1) asm volatile("wfi");
+        }
+    }
 }
 
-static bool fwcfg_find_file(const char* fname, uint16_t* out_select, uint32_t* out_size) {
-    uint32_t count_be = 0;
-    uint32_t ctl = ((uint32_t)FW_CFG_FILE_DIR << 16) | FW_DMA_SELECT | FW_DMA_READ;
-    fwcfg_dma_transfer(ctl, &count_be, 4);
-    
-    uint32_t count = be32_to_cpu(count_be);
-    uart_puts("  File count: ");
-    uart_puthex_u32(count);
+static bool fw_cfg_find_file(const char* target, uint16_t& out_sel, uint32_t& out_size) {
+    uart_puts("fw_cfg: reading FILE_DIR...\n");
+
+    uint32_t n_be = 0;
+    fw_cfg_dma_transfer(((uint32_t)FW_CFG_FILE_DIR << 16) | DMA_CTL_SELECT | DMA_CTL_READ,
+                        &n_be, sizeof(n_be));
+    uint32_t n = bswap32(n_be);
+
+    uart_puts("fw_cfg: FILE_DIR entries = ");
+    uart_hex32(n);
     uart_puts("\n");
-    
-    FWCfgFile entry;
-    size_t fname_len = my_strlen(fname);
-    
-    for (uint32_t i = 0; i < count; ++i) {
-        fwcfg_dma_transfer(FW_DMA_READ, &entry, sizeof(entry));
-        
+
+    FWCfgFile ent;
+    for (uint32_t i = 0; i < n; i++) {
+        fw_cfg_dma_transfer(DMA_CTL_READ, &ent, sizeof(ent));
+
+        uint32_t size = bswap32(ent.size_be);
+        uint16_t sel  = bswap16(ent.select_be);
+
+        // Print entry name + sel (useful debug, matches your logs)
+        uart_puts("fw_cfg: entry name = ");
+        // name is NUL-terminated for these entries in practice
+        uart_puts(ent.name);
+        uart_puts(" sel=");
+        uart_hex32(sel);
+        uart_puts(" size=");
+        uart_hex32(size);
+        uart_puts("\n");
+
+        // Compare with target
         bool match = true;
-        for (size_t j = 0; j < fname_len && j < 55; ++j) {
-            if (entry.name[j] != fname[j]) { match = false; break; }
+        for (size_t k = 0; k < 56; k++) {
+            char a = ent.name[k];
+            char b = (k < c_strlen(target)) ? target[k] : '\0';
+            if (a != b) { match = false; break; }
+            if (a == '\0' && b == '\0') break;
         }
-        if (match && entry.name[fname_len] == '\0') {
-            *out_select = be16_to_cpu(entry.select_be);
-            *out_size = be32_to_cpu(entry.size_be);
+
+        if (match) {
+            out_sel  = sel;
+            out_size = size;
             return true;
         }
     }
     return false;
 }
 
-// ------------------------------------------------------------
-// ramfb config
-// ------------------------------------------------------------
-struct __attribute__((packed, aligned(16))) RAMFBCfg {
-    uint64_t addr;
-    uint32_t fourcc;
-    uint32_t flags;
-    uint32_t width;
-    uint32_t height;
-    uint32_t stride;
-};
+static constexpr uint32_t fourcc(char a, char b, char c, char d) {
+    return (uint32_t)(uint8_t)a |
+           ((uint32_t)(uint8_t)b << 8) |
+           ((uint32_t)(uint8_t)c << 16) |
+           ((uint32_t)(uint8_t)d << 24);
+}
 
-static constexpr uint32_t DRM_FORMAT_XRGB8888 = 
-    (uint32_t)'X' | ((uint32_t)'R' << 8) | ((uint32_t)'2' << 16) | ((uint32_t)'4' << 24);
-
+/* ------------------------- Heat2D demo ------------------------- */
 static constexpr uint32_t FB_W = 800;
 static constexpr uint32_t FB_H = 600;
 
-alignas(4096) static uint32_t g_fb[FB_W * FB_H];
+// 200x150 maps perfectly to 800x600 with 4x4 pixel blocks
+static constexpr uint32_t SIM_W = 200;
+static constexpr uint32_t SIM_H = 150;
 
-static RAMFBCfg g_ramfb_cfg __attribute__((aligned(4096)));
+static float g_field[SIM_W * SIM_H];
+static float g_next[SIM_W * SIM_H];
 
-static void ramfb_init() {
-    uart_puts("  Searching for etc/ramfb...\n");
-    
-    uint16_t sel = 0;
-    uint32_t size = 0;
-    if (!fwcfg_find_file("etc/ramfb", &sel, &size)) {
-        panic("etc/ramfb not found - use: -device ramfb");
-    }
-    
-    uart_puts("  Found: sel=0x");
-    uart_puthex_u32(sel);
-    uart_puts(" size=");
-    uart_puthex_u32(size);
-    uart_puts("\n");
-    
-    uart_puts("  FB addr: 0x");
-    uart_puthex_u64((uint64_t)(uintptr_t)g_fb);
-    uart_puts("\n");
-    
-    // Build config in global buffer (page-aligned for DMA)
-    g_ramfb_cfg.addr   = cpu_to_be64((uint64_t)(uintptr_t)g_fb);
-    g_ramfb_cfg.fourcc = cpu_to_be32(DRM_FORMAT_XRGB8888);
-    g_ramfb_cfg.flags  = cpu_to_be32(0);
-    g_ramfb_cfg.width  = cpu_to_be32(FB_W);
-    g_ramfb_cfg.height = cpu_to_be32(FB_H);
-    g_ramfb_cfg.stride = cpu_to_be32(FB_W * 4);
-    
-    uart_puts("  Config built, dumping bytes: ");
-    uint8_t* p = (uint8_t*)&g_ramfb_cfg;
-    for (int i = 0; i < 28; ++i) {
-        uart_puthex_u8(p[i]);
-        uart_putc(' ');
-    }
-    uart_puts("\n");
-    
-    uart_puts("  Sending config via DMA WRITE...\n");
-    uart_flush();
-    
-    uint32_t ctl = ((uint32_t)sel << 16) | FW_DMA_SELECT | FW_DMA_WRITE;
-    
-    uart_puts("  DMA ctl=0x");
-    uart_puthex_u32(ctl);
-    uart_puts("\n");
-    uart_flush();
-    
-    fwcfg_dma_transfer(ctl, &g_ramfb_cfg, 28);
-    
-    uart_puts("  ramfb configured!\n");
-}
+struct RGB { uint8_t r, g, b; };
+struct Stop { float t; RGB c; };
+struct Palette { const char* name; Stop s[4]; };
 
-// ------------------------------------------------------------
-// Heat2D simulation + palette
-// ------------------------------------------------------------
-static constexpr uint32_t SIM_W = 180;
-static constexpr uint32_t SIM_H = 120;
-
-static float field[SIM_W * SIM_H];
-static float nextf[SIM_W * SIM_H];
-
-struct ColorStop { float t; uint8_t r, g, b; };
-struct Palette { const char* name; ColorStop s[4]; };
-
-static Palette palettes[] = {
-    {"Fiery", {{0.00f,20,24,82},{0.35f,30,120,200},{0.65f,255,180,60},{1.00f,255,255,245}}},
-    {"Ocean", {{0.00f,10,40,70},{0.40f,40,140,170},{0.75f,80,210,190},{1.00f,230,255,255}}},
-    {"Magenta", {{0.00f,55,10,60},{0.35f,140,30,140},{0.70f,240,120,200},{1.00f,255,240,255}}},
+static Palette g_pal[3] = {
+    {"Fiery", {
+        {0.00f, { 20,  24,  82}},
+        {0.35f, { 30, 120, 200}},
+        {0.65f, {255, 180,  60}},
+        {1.00f, {255, 255, 245}},
+    }},
+    {"Ocean", {
+        {0.00f, { 10,  40,  70}},
+        {0.40f, { 40, 140, 170}},
+        {0.75f, { 80, 210, 190}},
+        {1.00f, {230, 255, 255}},
+    }},
+    {"Magenta", {
+        {0.00f, { 55,  10,  60}},
+        {0.35f, {140,  30, 140}},
+        {0.70f, {240, 120, 200}},
+        {1.00f, {255, 240, 255}},
+    }},
 };
-static uint32_t palette_idx = 0;
 
-static inline float clamp01(float x) { return x < 0.f ? 0.f : (x > 1.f ? 1.f : x); }
+static uint32_t g_lut[3][256];
 
-static inline uint32_t pack_xrgb(uint8_t r, uint8_t g, uint8_t b) {
-    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+static inline float clamp01(float x) {
+    if (x < 0.f) return 0.f;
+    if (x > 1.f) return 1.f;
+    return x;
 }
 
 static inline uint8_t lerp_u8(uint8_t a, uint8_t b, float t) {
     float v = (float)a + ((float)b - (float)a) * t;
-    return (uint8_t)(v < 0.f ? 0.f : (v > 255.f ? 255.f : v));
+    if (v < 0.f) v = 0.f;
+    if (v > 255.f) v = 255.f;
+    return (uint8_t)(v + 0.5f);
 }
 
-static uint32_t sample_palette(float t) {
+static RGB sample_palette(const Palette& p, float t) {
     t = clamp01(t);
-    const Palette& p = palettes[palette_idx];
-    for (int i = 1; i < 4; ++i) {
+    for (int i = 1; i < 4; i++) {
         if (t <= p.s[i].t) {
-            float span = p.s[i].t - p.s[i-1].t;
-            float local = span > 0.f ? (t - p.s[i-1].t) / span : 0.f;
-            return pack_xrgb(
-                lerp_u8(p.s[i-1].r, p.s[i].r, local),
-                lerp_u8(p.s[i-1].g, p.s[i].g, local),
-                lerp_u8(p.s[i-1].b, p.s[i].b, local));
+            float t0 = p.s[i-1].t;
+            float t1 = p.s[i].t;
+            float span = (t1 - t0);
+            float u = (span > 0.f) ? ((t - t0) / span) : 0.f;
+            RGB a = p.s[i-1].c;
+            RGB b = p.s[i].c;
+            return { lerp_u8(a.r, b.r, u), lerp_u8(a.g, b.g, u), lerp_u8(a.b, b.b, u) };
         }
     }
-    return pack_xrgb(p.s[3].r, p.s[3].g, p.s[3].b);
+    return p.s[3].c;
 }
 
-static void heat_reset() {
-    for (uint32_t i = 0; i < SIM_W * SIM_H; ++i) {
-        field[i] = nextf[i] = 0.02f;
-    }
-}
-
-static void stamp_heat(uint32_t cx, uint32_t cy, float value) {
-    const int R = 6;
-    for (int dy = -R; dy <= R; ++dy) {
-        for (int dx = -R; dx <= R; ++dx) {
-            int x = (int)cx + dx, y = (int)cy + dy;
-            if (x > 0 && y > 0 && x < (int)SIM_W-1 && y < (int)SIM_H-1 && dx*dx+dy*dy <= R*R)
-                nextf[y * SIM_W + x] = value;
+static void build_luts() {
+    for (int p = 0; p < 3; p++) {
+        for (int i = 0; i < 256; i++) {
+            float t = (float)i / 255.0f;
+            RGB c = sample_palette(g_pal[p], t);
+            // XRGB8888: 0x00RRGGBB
+            g_lut[p][i] = ((uint32_t)c.r << 16) | ((uint32_t)c.g << 8) | (uint32_t)c.b;
         }
     }
 }
 
-static void heat_step(float dt) {
-    const float alpha = 0.20f, cooling = 0.0008f, r = alpha * dt;
-    for (uint32_t y = 1; y < SIM_H - 1; ++y) {
-        for (uint32_t x = 1; x < SIM_W - 1; ++x) {
-            uint32_t i = y * SIM_W + x;
-            float lap = field[i-1] + field[i+1] + field[i-SIM_W] + field[i+SIM_W] - 4.f*field[i];
-            nextf[i] = clamp01(field[i] + r*lap - cooling*field[i]);
-        }
+static void reset_field() {
+    for (uint32_t i = 0; i < SIM_W * SIM_H; i++) {
+        g_field[i] = 0.02f;
+        g_next[i]  = 0.02f;
     }
-    for (uint32_t x = 0; x < SIM_W; ++x) { nextf[x] = 0.f; nextf[(SIM_H-1)*SIM_W+x] = 0.f; }
-    for (uint32_t y = 0; y < SIM_H; ++y) { nextf[y*SIM_W] = 0.f; nextf[y*SIM_W+SIM_W-1] = 0.f; }
-    stamp_heat(SIM_W/2, SIM_H/2, 1.0f);
-    for (uint32_t i = 0; i < SIM_W * SIM_H; ++i) field[i] = nextf[i];
 }
 
-static void heat_render() {
-    volatile uint32_t* fb = (volatile uint32_t*)g_fb;
-    for (uint32_t y = 0; y < FB_H; ++y) {
-        uint32_t sy = (y * SIM_H) / FB_H;
-        for (uint32_t x = 0; x < FB_W; ++x) {
-            uint32_t sx = (x * SIM_W) / FB_W;
-            fb[y * FB_W + x] = sample_palette(field[sy * SIM_W + sx]);
+static void stamp_disk(float* buf, int cx, int cy, int r, float v) {
+    int r2 = r * r;
+    for (int dy = -r; dy <= r; dy++) {
+        for (int dx = -r; dx <= r; dx++) {
+            int x = cx + dx;
+            int y = cy + dy;
+            if (x <= 0 || y <= 0 || x >= (int)SIM_W-1 || y >= (int)SIM_H-1) continue;
+            if (dx*dx + dy*dy <= r2) buf[(uint32_t)y * SIM_W + (uint32_t)x] = v;
         }
     }
-    dsb_sy();
 }
 
-// ------------------------------------------------------------
-// C++ ABI stubs
-// ------------------------------------------------------------
-extern "C" void __cxa_pure_virtual() { panic("pure virtual"); }
-extern "C" int  __cxa_atexit(void (*)(void*), void*, void*) { return 0; }
-extern "C" void* __dso_handle = nullptr;
+static void step_sim() {
+    constexpr float alpha   = 0.20f;
+    constexpr float cooling = 0.0008f;
 
-// ------------------------------------------------------------
-// Entry
-// ------------------------------------------------------------
-extern "C" void kmain(void) {
-    uart_init();
-    uart_puts("\n=== Heat2D ramfb ===\n");
-    
-    ramfb_init();
-    
-    uart_puts("Drawing test pattern...\n");
-    volatile uint32_t* fb = (volatile uint32_t*)g_fb;
-    for (uint32_t y = 0; y < FB_H; ++y) {
-        for (uint32_t x = 0; x < FB_W; ++x) {
-            fb[y * FB_W + x] = pack_xrgb(
-                (uint8_t)((x * 255) / FB_W),
-                (uint8_t)((y * 255) / FB_H),
-                128);
+    for (uint32_t y = 1; y < SIM_H - 1; y++) {
+        for (uint32_t x = 1; x < SIM_W - 1; x++) {
+            uint32_t idx = y * SIM_W + x;
+            float t = g_field[idx];
+            float lap =
+                g_field[idx - 1] + g_field[idx + 1] +
+                g_field[idx - SIM_W] + g_field[idx + SIM_W] -
+                4.0f * t;
+            float next = t + alpha * lap - cooling * t;
+            g_next[idx] = clamp01(next);
         }
     }
-    dsb_sy();
-    
-    uart_puts("Test pattern drawn. Waiting...\n");
-    delay_ms(2000);
-    
-    heat_reset();
-    uart_puts("Starting simulation...\n");
-    
-    uint64_t last_switch = read_cntpct_el0();
-    uint64_t freq = read_cntfrq_el0();
-    
-    for (;;) {
-        heat_step(1.0f);
-        heat_render();
-        
-        uint64_t now = read_cntpct_el0();
-        if ((now - last_switch) > freq * 8) {
-            palette_idx = (palette_idx + 1) % 3;
-            last_switch = now;
+
+    // boundaries
+    for (uint32_t x = 0; x < SIM_W; x++) {
+        g_next[x] = 0.f;
+        g_next[(SIM_H - 1) * SIM_W + x] = 0.f;
+    }
+    for (uint32_t y = 0; y < SIM_H; y++) {
+        g_next[y * SIM_W] = 0.f;
+        g_next[y * SIM_W + (SIM_W - 1)] = 0.f;
+    }
+
+    // heat source
+    stamp_disk(g_next, (int)SIM_W/2, (int)SIM_H/2, 7, 1.0f);
+
+    // swap
+    for (uint32_t i = 0; i < SIM_W * SIM_H; i++) g_field[i] = g_next[i];
+}
+
+static void render(uint32_t* fb, uint32_t palette_idx) {
+    constexpr uint32_t SCALE_X = FB_W / SIM_W; // 4
+    constexpr uint32_t SCALE_Y = FB_H / SIM_H; // 4
+
+    for (uint32_t y = 0; y < SIM_H; y++) {
+        for (uint32_t x = 0; x < SIM_W; x++) {
+            float t = g_field[y * SIM_W + x];
+            uint32_t pi = (uint32_t)(t * 255.0f);
+            if (pi > 255) pi = 255;
+            uint32_t color = g_lut[palette_idx][pi];
+
+            uint32_t base_y = y * SCALE_Y;
+            uint32_t base_x = x * SCALE_X;
+
+            for (uint32_t dy = 0; dy < SCALE_Y; dy++) {
+                uint32_t* row = fb + (base_y + dy) * FB_W + base_x;
+                for (uint32_t dx = 0; dx < SCALE_X; dx++) {
+                    row[dx] = color;
+                }
+            }
         }
+    }
+}
+
+/* ------------------------- Main ------------------------- */
+extern "C" int main(void) {
+    uart_puts("\n=== Heat2D on QEMU virt via ramfb (800x600) ===\n");
+    uart_puts("PL011 @ "); uart_hex64(UART_BASE); uart_puts("\n");
+    uart_puts("fw_cfg @ "); uart_hex64(FW_CFG_BASE);
+    uart_puts(", DMA @ "); uart_hex64(FW_CFG_DMA_ADDR); uart_puts("\n");
+
+    // Find etc/ramfb in fw_cfg directory
+    uint16_t ramfb_sel = 0;
+    uint32_t ramfb_size = 0;
+    if (!fw_cfg_find_file("etc/ramfb", ramfb_sel, ramfb_size)) {
+        uart_puts("fw_cfg: could not find etc/ramfb\nHALTING.\n");
+        while (1) asm volatile("wfi");
+    }
+
+    uart_puts("fw_cfg: FOUND etc/ramfb select=");
+    uart_hex32(ramfb_sel);
+    uart_puts(" size=");
+    uart_hex32(ramfb_size);
+    uart_puts("\n");
+
+    // Framebuffer placed right after .bss
+    uintptr_t fb_addr = (uintptr_t)__bss_end__;
+    fb_addr = (fb_addr + 0xFFFu) & ~0xFFFu; // 4K align
+
+    uart_puts("Framebuffer addr = "); uart_hex64((uint64_t)fb_addr); uart_puts("\n");
+
+    // Configure ramfb (IMPORTANT: packed struct = 28 bytes)
+    RAMFBCfg cfg;
+    cfg.addr_be   = bswap64((uint64_t)fb_addr);
+    cfg.fourcc_be = bswap32(fourcc('X','R','2','4')); // XRGB8888
+    cfg.flags_be  = bswap32(0);
+    cfg.width_be  = bswap32(FB_W);
+    cfg.height_be = bswap32(FB_H);
+    cfg.stride_be = bswap32(0); // let QEMU compute stride (safe)
+
+    uart_puts("Configuring ramfb...\n");
+    fw_cfg_dma_transfer(((uint32_t)ramfb_sel << 16) | DMA_CTL_SELECT | DMA_CTL_WRITE,
+                        &cfg, (uint32_t)sizeof(cfg));
+
+    uart_puts("ramfb configured OK. Painting test screen...\n");
+
+    // If ramfb config worked, you should immediately see this red screen
+    uint32_t* fb = (uint32_t*)fb_addr;
+    for (uint32_t i = 0; i < FB_W * FB_H; i++) fb[i] = 0x00FF0000; // red
+    delay_ms(250);
+
+    build_luts();
+    reset_field();
+
+    uart_puts("virt ramfb init OK, rendering Heat2D...\n");
+
+    uint32_t pal = 0;
+    uint32_t frame = 0;
+
+    while (1) {
+        step_sim();
+        render(fb, pal);
+
+        frame++;
+        if ((frame % 600) == 0) { // roughly every ~10s at ~60fps-ish
+            pal = (pal + 1) % 3;
+        }
+
         delay_ms(16);
     }
 }
