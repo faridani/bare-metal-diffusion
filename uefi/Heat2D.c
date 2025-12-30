@@ -94,7 +94,18 @@ STATIC BOOLEAN TryReadKey(EFI_SYSTEM_TABLE *SystemTable, EFI_INPUT_KEY *OutKey) 
   return !EFI_ERROR(st);
 }
 
-// -------------------- Viridis-like LUT --------------------
+// -------------------- Color palettes + LUT --------------------
+typedef struct {
+  float t;
+  UINT8 r, g, b;
+} COLOR_STOP;
+
+typedef struct {
+  const CHAR8    *Name;
+  const COLOR_STOP *Stops;
+  UINTN           StopCount;
+} COLOR_PALETTE;
+
 STATIC UINT8 LerpU8(UINT8 a, UINT8 b, float t) {
   float x = (1.0f - t) * (float)a + t * (float)b;
   if (x < 0) x = 0;
@@ -102,30 +113,52 @@ STATIC UINT8 LerpU8(UINT8 a, UINT8 b, float t) {
   return (UINT8)(x + 0.5f);
 }
 
-STATIC VOID BuildViridisLikeLut(VOID) {
-  typedef struct { float t; UINT8 r,g,b; } Stop;
-  STATIC CONST Stop stops[] = {
-    {0.00f,  68,  1,  84},
-    {0.25f,  59, 82, 139},
-    {0.50f,  33,145, 140},
-    {0.75f,  94,201,  98},
-    {1.00f, 253,231,  37},
-  };
+STATIC CONST COLOR_STOP gViridisStops[] = {
+  {0.00f,  68,  1,  84},
+  {0.25f,  59, 82, 139},
+  {0.50f,  33,145, 140},
+  {0.75f,  94,201,  98},
+  {1.00f, 253,231,  37},
+};
 
+STATIC CONST COLOR_STOP gInfernoStops[] = {
+  {0.00f,   0,  0,   4},
+  {0.25f,  87, 15, 109},
+  {0.50f, 187, 55,  84},
+  {0.75f, 249,142,  23},
+  {1.00f, 252,255, 164},
+};
+
+STATIC CONST COLOR_STOP gCoolWarmStops[] = {
+  {0.00f,  59,  76, 192},
+  {0.25f,  94,131, 199},
+  {0.50f, 186,186, 186},
+  {0.75f, 204,102, 102},
+  {1.00f, 180,  4,  38},
+};
+
+STATIC CONST COLOR_PALETTE gPalettes[] = {
+  {"Viridis",   gViridisStops,  sizeof(gViridisStops)   / sizeof(gViridisStops[0])},
+  {"Inferno",   gInfernoStops,  sizeof(gInfernoStops)   / sizeof(gInfernoStops[0])},
+  {"CoolWarm",  gCoolWarmStops, sizeof(gCoolWarmStops)  / sizeof(gCoolWarmStops[0])},
+};
+
+STATIC VOID BuildPaletteLut(const COLOR_PALETTE *Pal) {
+  if (!Pal || Pal->StopCount < 2) return;
   for (INT32 i = 0; i < 256; i++) {
     float t = (float)i / 255.0f;
 
     INT32 k = 0;
-    while (k < (INT32)(sizeof(stops)/sizeof(stops[0])) - 2 && t > stops[k+1].t) k++;
+    while (k < (INT32)Pal->StopCount - 2 && t > Pal->Stops[k+1].t) k++;
 
-    float t0 = stops[k].t;
-    float t1 = stops[k+1].t;
+    float t0 = Pal->Stops[k].t;
+    float t1 = Pal->Stops[k+1].t;
     float u = (t1 > t0) ? ((t - t0) / (t1 - t0)) : 0.0f;
     u = ClampF32(u, 0.0f, 1.0f);
 
-    gColorLut[i].r = LerpU8(stops[k].r, stops[k+1].r, u);
-    gColorLut[i].g = LerpU8(stops[k].g, stops[k+1].g, u);
-    gColorLut[i].b = LerpU8(stops[k].b, stops[k+1].b, u);
+    gColorLut[i].r = LerpU8(Pal->Stops[k].r, Pal->Stops[k+1].r, u);
+    gColorLut[i].g = LerpU8(Pal->Stops[k].g, Pal->Stops[k+1].g, u);
+    gColorLut[i].b = LerpU8(Pal->Stops[k].b, Pal->Stops[k+1].b, u);
   }
 }
 
@@ -358,7 +391,8 @@ STATIC VOID DrawFooter(UINT32 *Fb, UINTN Width, UINTN Height, UINTN Ppsl, const 
   DrawString8(Fb, Width, Height, Ppsl, padX, y0 + padY, msg, fg, bg, FALSE);
 }
 
-STATIC VOID DrawLegendWithLabels(UINT32 *Fb, UINTN Width, UINTN Height, UINTN Ppsl, const PIXEL_PACKER *Packer) {
+STATIC VOID DrawLegendWithLabels(UINT32 *Fb, UINTN Width, UINTN Height, UINTN Ppsl,
+                                 const PIXEL_PACKER *Packer, const CHAR8 *PaletteName) {
   UINTN barW = (Width > 200) ? 24 : 16;
   UINTN barH = (Height > 240) ? (Height / 2) : (Height * 2 / 3);
 
@@ -375,7 +409,7 @@ STATIC VOID DrawLegendWithLabels(UINT32 *Fb, UINTN Width, UINTN Height, UINTN Pp
   UINTN panelX = (x0 >= 6) ? (x0 - 6) : 0;
   UINTN panelY = (y0 >= 6) ? (y0 - 6) : 0;
   UINTN panelW = barW + 12 + labelW + 12;
-  UINTN panelH = barH + 12;
+  UINTN panelH = barH + 12 + 10;
 
   UINT32 panel  = PackPixel(Packer, 20, 20, 20);
   UINT32 border = PackPixel(Packer, 220, 220, 220);
@@ -401,6 +435,12 @@ STATIC VOID DrawLegendWithLabels(UINT32 *Fb, UINTN Width, UINTN Height, UINTN Pp
   DrawString8(Fb, Width, Height, Ppsl, lx, y0 + 0,          "HOT  1.0", text, panel, FALSE);
   DrawString8(Fb, Width, Height, Ppsl, lx, y0 + barH/2 - 4, "MID  0.5", text, panel, FALSE);
   DrawString8(Fb, Width, Height, Ppsl, lx, y0 + barH - 8,   "COLD 0.0", text, panel, FALSE);
+
+  if (PaletteName && PaletteName[0] != '\0') {
+    CHAR8 label[32];
+    AsciiSPrint(label, sizeof(label), "Palette: %a", PaletteName);
+    DrawString8(Fb, Width, Height, Ppsl, panelX + 4, y0 + barH + 6, label, text, panel, FALSE);
+  }
 }
 
 // -------------------- Pointer handling --------------------
@@ -666,7 +706,8 @@ EFI_STATUS EFIAPI UefiMain(IN EFI_HANDLE ImageHandle, IN EFI_SYSTEM_TABLE *Syste
     SetMem(&Packer.Masks, sizeof(Packer.Masks), 0);
   }
 
-  BuildViridisLikeLut();
+  UINTN paletteIdx = 0;
+  BuildPaletteLut(&gPalettes[paletteIdx]);
 
   UINT32 *Fb = (UINT32*)(UINTN)Gop->Mode->FrameBufferBase;
 
@@ -764,6 +805,10 @@ EFI_STATUS EFIAPI UefiMain(IN EFI_HANDLE ImageHandle, IN EFI_SYSTEM_TABLE *Syste
         dirty = TRUE;
       } else if (Key.UnicodeChar == L'c' || Key.UnicodeChar == L'C') {
         SetMem(A, sizeof(float)*NX*NY, 0);
+        dirty = TRUE;
+      } else if (Key.UnicodeChar == L'p' || Key.UnicodeChar == L'P') {
+        paletteIdx = (paletteIdx + 1) % (sizeof(gPalettes)/sizeof(gPalettes[0]));
+        BuildPaletteLut(&gPalettes[paletteIdx]);
         dirty = TRUE;
       } else if (Key.UnicodeChar == L'b' || Key.UnicodeChar == L'B') {
         bc = (BOUNDARY_MODE)((bc + 1) % BC_COUNT);
@@ -870,7 +915,7 @@ EFI_STATUS EFIAPI UefiMain(IN EFI_HANDLE ImageHandle, IN EFI_SYSTEM_TABLE *Syste
       }
 
       DrawCursor(Fb, Width, Height, Ppsl, (UINTN)Ptr.X, (UINTN)Ptr.Y, &Packer);
-      DrawLegendWithLabels(Fb, Width, Height, Ppsl, &Packer);
+      DrawLegendWithLabels(Fb, Width, Height, Ppsl, &Packer, gPalettes[paletteIdx].Name);
       DrawFooter(Fb, Width, Height, Ppsl, &Packer);
 
       dirty = FALSE;
