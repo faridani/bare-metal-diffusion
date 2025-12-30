@@ -275,7 +275,7 @@ TShutdownMode CHeat2DKernel::Run() {
         if (m_Serial.AvailableForRead() > 0) {
             char ch;
             if (m_Serial.Read(&ch, 1) == 1) {
-                char buf[2] = { ch, '\\0' };
+                char buf[2] = { ch, '\0' };
                 HandleKey(buf);
             }
         }
