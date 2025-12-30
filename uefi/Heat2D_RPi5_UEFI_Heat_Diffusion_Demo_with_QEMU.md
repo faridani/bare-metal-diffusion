@@ -1,5 +1,7 @@
 # Heat2D (UEFI) — 2D Heat Diffusion Demo on Raspberry Pi 5 (HDMI, Pre‑OS)
 
+> **Repository note:** All UEFI sources, helper scripts, and documentation now live under `uefi/` in this repository. When the guide below refers to `Heat2D.c`, `Heat2D.inf`, or `Heat2D.sh`, use the copies in `uefi/`.
+
 
 It contains:
 
