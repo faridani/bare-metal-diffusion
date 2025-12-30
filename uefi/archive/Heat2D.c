@@ -13,15 +13,15 @@
 #include <Protocol/AbsolutePointer.h>
 
 typedef enum {
-  BC_DIRICHLET_COLD = 0,   // fixed cold edges (0)
-  BC_NEUMANN_INSULATED,    // zero-flux edges
-  BC_MIXED,                // left/right cold, top/bottom insulated
+  BC_DIRICHLET_COLD = 0,
+  BC_NEUMANN_INSULATED,
+  BC_MIXED,
   BC_COUNT
 } BOUNDARY_MODE;
 
 typedef struct {
   EFI_GRAPHICS_PIXEL_FORMAT Fmt;
-  EFI_PIXEL_BITMASK         Masks;  // only used when Fmt == PixelBitMask
+  EFI_PIXEL_BITMASK         Masks;
 } PIXEL_PACKER;
 
 typedef struct {
@@ -30,20 +30,23 @@ typedef struct {
 
 STATIC RGB8 gColorLut[256];
 
-// -------------------- Basic helpers --------------------
-STATIC float ClampF32(float v, float lo, float hi) {
+// ==================== Fixed-point formats ====================
+// Temperature T: Q16.16 signed (INT32), range [0..1] -> [0..65536]
+#define Q16_SHIFT 16
+#define Q16_ONE   (1 << Q16_SHIFT)
+#define Q16_HALF  (1 << (Q16_SHIFT-1))
+
+// Conductivity k: Q0.16 unsigned (UINT16), range [0..1] -> [0..65535]
+#define K_SHIFT 16
+#define K_ONE   65535u
+
+STATIC inline INT32 ClampI32(INT32 v, INT32 lo, INT32 hi) {
   if (v < lo) return lo;
   if (v > hi) return hi;
   return v;
 }
 
-STATIC INT32 ClampI32(INT32 v, INT32 lo, INT32 hi) {
-  if (v < lo) return lo;
-  if (v > hi) return hi;
-  return v;
-}
-
-STATIC UINT32 Scale8ToMask(UINT8 c, UINT32 mask) {
+STATIC inline UINT32 Scale8ToMask(UINT8 c, UINT32 mask) {
   if (mask == 0) return 0;
 
   UINT32 shift = 0;
@@ -67,14 +70,12 @@ STATIC UINT32 Scale8ToMask(UINT8 c, UINT32 mask) {
   return (scaled << shift) & mask;
 }
 
-STATIC UINT32 PackPixel(const PIXEL_PACKER *P, UINT8 r, UINT8 g, UINT8 b) {
+STATIC inline UINT32 PackPixel(const PIXEL_PACKER *P, UINT8 r, UINT8 g, UINT8 b) {
   switch (P->Fmt) {
     case PixelRedGreenBlueReserved8BitPerColor:
       return ((UINT32)r) | ((UINT32)g << 8) | ((UINT32)b << 16) | (0xFFu << 24);
-
     case PixelBlueGreenRedReserved8BitPerColor:
       return ((UINT32)b) | ((UINT32)g << 8) | ((UINT32)r << 16) | (0xFFu << 24);
-
     case PixelBitMask: {
       UINT32 out = 0;
       out |= Scale8ToMask(r, P->Masks.RedMask);
@@ -83,7 +84,6 @@ STATIC UINT32 PackPixel(const PIXEL_PACKER *P, UINT8 r, UINT8 g, UINT8 b) {
       if (P->Masks.ReservedMask != 0) out |= P->Masks.ReservedMask;
       return out;
     }
-
     default:
       return ((UINT32)b) | ((UINT32)g << 8) | ((UINT32)r << 16) | (0xFFu << 24);
   }
@@ -114,48 +114,44 @@ STATIC VOID BuildViridisLikeLut(VOID) {
 
   for (INT32 i = 0; i < 256; i++) {
     float t = (float)i / 255.0f;
-
     INT32 k = 0;
     while (k < (INT32)(sizeof(stops)/sizeof(stops[0])) - 2 && t > stops[k+1].t) k++;
-
     float t0 = stops[k].t;
     float t1 = stops[k+1].t;
     float u = (t1 > t0) ? ((t - t0) / (t1 - t0)) : 0.0f;
-    u = ClampF32(u, 0.0f, 1.0f);
-
+    if (u < 0) {u = 0;} 
+    if (u > 1) {u = 1;}
+    
     gColorLut[i].r = LerpU8(stops[k].r, stops[k+1].r, u);
     gColorLut[i].g = LerpU8(stops[k].g, stops[k+1].g, u);
     gColorLut[i].b = LerpU8(stops[k].b, stops[k+1].b, u);
   }
 }
 
-STATIC VOID TempToRGB_LUT(float t, UINT8 *r, UINT8 *g, UINT8 *b) {
-  t = ClampF32(t, 0.0f, 1.0f);
-  INT32 idx = (INT32)(t * 255.0f + 0.5f);
+STATIC inline void TempQ16_ToRGB(INT32 tQ16, UINT8 *r, UINT8 *g, UINT8 *b) {
+  if (tQ16 < 0) tQ16 = 0;
+  if (tQ16 > Q16_ONE) tQ16 = Q16_ONE;
+
+  // idx = round(t*255)
+  // tQ16 in [0..65536]
+  INT32 idx = (INT32)((((INT64)tQ16) * 255 + Q16_HALF) >> Q16_SHIFT);
   idx = ClampI32(idx, 0, 255);
+
   *r = gColorLut[idx].r;
   *g = gColorLut[idx].g;
   *b = gColorLut[idx].b;
 }
 
-// -------------------- Physics: face conductivity --------------------
-STATIC float KFaceHarmonic(float k0, float k1) {
-  const float eps = 1e-12f;
-  float denom = k0 + k1;
-  if (denom < eps) return 0.0f;
-  return (2.0f * k0 * k1) / denom;
-}
-
-// -------------------- Simulation helpers --------------------
-STATIC VOID ApplyBoundary(float *T, INT32 NX, INT32 NY, BOUNDARY_MODE Mode) {
+// -------------------- PDE boundary conditions --------------------
+STATIC VOID ApplyBoundaryQ16(INT32 *T, INT32 NX, INT32 NY, BOUNDARY_MODE Mode) {
   if (Mode == BC_DIRICHLET_COLD) {
     for (INT32 i = 0; i < NX; i++) {
-      T[i] = 0.0f;
-      T[(NY-1)*NX + i] = 0.0f;
+      T[i] = 0;
+      T[(NY-1)*NX + i] = 0;
     }
     for (INT32 j = 0; j < NY; j++) {
-      T[j*NX] = 0.0f;
-      T[j*NX + (NX-1)] = 0.0f;
+      T[j*NX] = 0;
+      T[j*NX + (NX-1)] = 0;
     }
     return;
   }
@@ -178,20 +174,21 @@ STATIC VOID ApplyBoundary(float *T, INT32 NX, INT32 NY, BOUNDARY_MODE Mode) {
 
   // BC_MIXED
   for (INT32 j = 0; j < NY; j++) {
-    T[j*NX + 0] = 0.0f;
-    T[j*NX + (NX-1)] = 0.0f;
+    T[j*NX + 0] = 0;
+    T[j*NX + (NX-1)] = 0;
   }
   for (INT32 i = 1; i < NX-1; i++) {
     T[0*NX + i]      = T[1*NX + i];
     T[(NY-1)*NX + i] = T[(NY-2)*NX + i];
   }
-  T[0] = 0.0f;
-  T[NX-1] = 0.0f;
-  T[(NY-1)*NX] = 0.0f;
-  T[(NY-1)*NX + (NX-1)] = 0.0f;
+  T[0] = 0;
+  T[NX-1] = 0;
+  T[(NY-1)*NX] = 0;
+  T[(NY-1)*NX + (NX-1)] = 0;
 }
 
-STATIC VOID StampDisk(float *T, INT32 NX, INT32 NY, INT32 cx, INT32 cy, INT32 rad, float val) {
+// -------------------- Heat stamping (fixed-point) --------------------
+STATIC VOID StampDiskQ16(INT32 *T, INT32 NX, INT32 NY, INT32 cx, INT32 cy, INT32 rad, INT32 valQ16) {
   INT32 r2 = rad * rad;
   INT32 y0 = ClampI32(cy - rad, 0, NY-1);
   INT32 y1 = ClampI32(cy + rad, 0, NY-1);
@@ -203,14 +200,14 @@ STATIC VOID StampDisk(float *T, INT32 NX, INT32 NY, INT32 cx, INT32 cy, INT32 ra
     for (INT32 i = x0; i <= x1; i++) {
       INT32 dx = i - cx;
       if (dx*dx + dy*dy <= r2) {
-        float *p = &T[j*NX + i];
-        if (val > *p) *p = val;
+        INT32 *p = &T[j*NX + i];
+        if (valQ16 > *p) *p = valQ16;
       }
     }
   }
 }
 
-STATIC VOID StampRectMax(float *T, INT32 NX, INT32 NY, INT32 x0, INT32 y0, INT32 w, INT32 h, float val) {
+STATIC VOID StampRectMaxQ16(INT32 *T, INT32 NX, INT32 NY, INT32 x0, INT32 y0, INT32 w, INT32 h, INT32 valQ16) {
   INT32 x1 = x0 + w - 1;
   INT32 y1 = y0 + h - 1;
 
@@ -220,9 +217,9 @@ STATIC VOID StampRectMax(float *T, INT32 NX, INT32 NY, INT32 x0, INT32 y0, INT32
   y1 = ClampI32(y1, 0, NY-1);
 
   for (INT32 y = y0; y <= y1; y++) {
-    float *row = &T[y*NX];
+    INT32 *row = &T[y*NX];
     for (INT32 x = x0; x <= x1; x++) {
-      if (val > row[x]) row[x] = val;
+      if (valQ16 > row[x]) row[x] = valQ16;
     }
   }
 }
@@ -257,8 +254,6 @@ STATIC CONST GLYPH8 gFont8[] = {
   {',', {0,0,0,0,0,0x18,0x18,0x30}},
   {'.', {0,0,0,0,0,0x18,0x18,0}},
   {':', {0,0x18,0x18,0,0,0x18,0x18,0}},
-  {'/', {0x02,0x04,0x08,0x10,0x20,0x40,0,0}},
-  {'%', {0x62,0x64,0x08,0x10,0x26,0x46,0,0}},
 
   {'0', {0x3C,0x66,0x6E,0x76,0x66,0x66,0x3C,0}},
   {'1', {0x18,0x38,0x18,0x18,0x18,0x18,0x3C,0}},
@@ -272,49 +267,35 @@ STATIC CONST GLYPH8 gFont8[] = {
   {'9', {0x3C,0x66,0x66,0x3E,0x06,0x0C,0x38,0}},
 
   {'A', {0x18,0x3C,0x66,0x66,0x7E,0x66,0x66,0}},
-  {'B', {0x7C,0x66,0x66,0x7C,0x66,0x66,0x7C,0}},
   {'C', {0x3C,0x66,0x60,0x60,0x60,0x66,0x3C,0}},
   {'D', {0x78,0x6C,0x66,0x66,0x66,0x6C,0x78,0}},
-  {'E', {0x7E,0x60,0x60,0x7C,0x60,0x60,0x7E,0}},
-  {'F', {0x7E,0x60,0x60,0x7C,0x60,0x60,0x60,0}},
-  {'G', {0x3C,0x66,0x60,0x6E,0x66,0x66,0x3C,0}},
   {'H', {0x66,0x66,0x66,0x7E,0x66,0x66,0x66,0}},
   {'I', {0x3C,0x18,0x18,0x18,0x18,0x18,0x3C,0}},
-  {'J', {0x1E,0x0C,0x0C,0x0C,0x0C,0x6C,0x38,0}},
-  {'K', {0x66,0x6C,0x78,0x70,0x78,0x6C,0x66,0}},
   {'L', {0x60,0x60,0x60,0x60,0x60,0x60,0x7E,0}},
   {'M', {0x63,0x77,0x7F,0x6B,0x63,0x63,0x63,0}},
-  {'N', {0x66,0x76,0x7E,0x7E,0x6E,0x66,0x66,0}},
   {'O', {0x3C,0x66,0x66,0x66,0x66,0x66,0x3C,0}},
   {'P', {0x7C,0x66,0x66,0x7C,0x60,0x60,0x60,0}},
-  {'Q', {0x3C,0x66,0x66,0x66,0x6E,0x3C,0x0E,0}},
   {'R', {0x7C,0x66,0x66,0x7C,0x78,0x6C,0x66,0}},
   {'S', {0x3C,0x66,0x60,0x3C,0x06,0x66,0x3C,0}},
   {'T', {0x7E,0x18,0x18,0x18,0x18,0x18,0x18,0}},
-  {'U', {0x66,0x66,0x66,0x66,0x66,0x66,0x3C,0}},
   {'V', {0x66,0x66,0x66,0x66,0x66,0x3C,0x18,0}},
-  {'W', {0x63,0x63,0x63,0x6B,0x7F,0x77,0x63,0}},
-  {'X', {0x66,0x66,0x3C,0x18,0x3C,0x66,0x66,0}},
+  {'E', {0x7E,0x60,0x60,0x7C,0x60,0x60,0x7E,0}},
+  {'B', {0x7C,0x66,0x66,0x7C,0x66,0x66,0x7C,0}},
+  {'N', {0x66,0x76,0x7E,0x7E,0x6E,0x66,0x66,0}},
   {'Y', {0x66,0x66,0x66,0x3C,0x18,0x18,0x18,0}},
-  {'Z', {0x7E,0x06,0x0C,0x18,0x30,0x60,0x7E,0}},
-
-  {'?', {0x3C,0x66,0x06,0x0C,0x18,0x00,0x18,0}},
 };
 
 STATIC const UINT8* FindGlyph8(CHAR8 ch) {
+  if (ch >= 'a' && ch <= 'z') ch = (CHAR8)(ch - 'a' + 'A');
   for (UINTN i = 0; i < (sizeof(gFont8)/sizeof(gFont8[0])); i++) {
     if (gFont8[i].Ch == ch) return gFont8[i].Row;
   }
-  for (UINTN i = 0; i < (sizeof(gFont8)/sizeof(gFont8[0])); i++) {
-    if (gFont8[i].Ch == '?') return gFont8[i].Row;
-  }
+  // unknown -> blank
   return gFont8[0].Row;
 }
 
 STATIC VOID DrawChar8(UINT32 *Fb, UINTN Width, UINTN Height, UINTN Ppsl,
-                      UINTN x, UINTN y, CHAR8 ch, UINT32 fg, UINT32 bg, BOOLEAN OpaqueBg) {
-  if (ch >= 'a' && ch <= 'z') ch = (CHAR8)(ch - 'a' + 'A');
-
+                      UINTN x, UINTN y, CHAR8 ch, UINT32 fg) {
   const UINT8 *rows = FindGlyph8(ch);
   for (UINTN ry = 0; ry < 8; ry++) {
     UINTN py = y + ry;
@@ -324,29 +305,24 @@ STATIC VOID DrawChar8(UINT32 *Fb, UINTN Width, UINTN Height, UINTN Ppsl,
     for (UINTN rx = 0; rx < 8; rx++) {
       UINTN px = x + rx;
       if (px >= Width) break;
-      BOOLEAN on = ((bits & (0x80u >> rx)) != 0);
-      if (on) row[px] = fg;
-      else if (OpaqueBg) row[px] = bg;
+      if (bits & (0x80u >> rx)) row[px] = fg;
     }
   }
 }
 
 STATIC VOID DrawString8(UINT32 *Fb, UINTN Width, UINTN Height, UINTN Ppsl,
-                        UINTN x, UINTN y, const CHAR8 *s, UINT32 fg, UINT32 bg, BOOLEAN OpaqueBg) {
+                        UINTN x, UINTN y, const CHAR8 *s, UINT32 fg) {
   UINTN cx = x;
   for (; *s; s++) {
     if (*s == '\n') { y += 10; cx = x; continue; }
-    DrawChar8(Fb, Width, Height, Ppsl, cx, y, *s, fg, bg, OpaqueBg);
+    DrawChar8(Fb, Width, Height, Ppsl, cx, y, *s, fg);
     cx += 8;
   }
 }
 
 STATIC VOID DrawFooter(UINT32 *Fb, UINTN Width, UINTN Height, UINTN Ppsl, const PIXEL_PACKER *Packer) {
   const CHAR8 *msg = "Dec 27, 2025 - Bare Metal Parabolic PDE Solver";
-
-  UINTN padX = 12;
-  UINTN padY = 6;
-  UINTN textH = 8;
+  UINTN padX = 12, padY = 6, textH = 8;
   UINTN boxH = textH + padY * 2;
   if (Height < boxH + 2) return;
 
@@ -355,7 +331,7 @@ STATIC VOID DrawFooter(UINT32 *Fb, UINTN Width, UINTN Height, UINTN Ppsl, const 
   UINT32 fg = PackPixel(Packer, 240, 240, 240);
 
   DrawRect(Fb, Width, Height, Ppsl, 0, y0, Width, boxH, bg);
-  DrawString8(Fb, Width, Height, Ppsl, padX, y0 + padY, msg, fg, bg, FALSE);
+  DrawString8(Fb, Width, Height, Ppsl, padX, y0 + padY, msg, fg);
 }
 
 STATIC VOID DrawLegendWithLabels(UINT32 *Fb, UINTN Width, UINTN Height, UINTN Ppsl, const PIXEL_PACKER *Packer) {
@@ -363,70 +339,57 @@ STATIC VOID DrawLegendWithLabels(UINT32 *Fb, UINTN Width, UINTN Height, UINTN Pp
   UINTN barH = (Height > 240) ? (Height / 2) : (Height * 2 / 3);
 
   UINTN footerH = 8 + 6*2;
-  if (Height > footerH + 24 && barH > Height - footerH - 24) {
-    barH = Height - footerH - 24;
-  }
+  if (Height > footerH + 24 && barH > Height - footerH - 24) barH = Height - footerH - 24;
   if (barH < 40) barH = 40;
 
   UINTN labelW = 72;
   UINTN x0 = (Width > (barW + 12 + labelW + 12)) ? (Width - barW - 12 - labelW - 12) : 0;
   UINTN y0 = 12;
 
-  UINTN panelX = (x0 >= 6) ? (x0 - 6) : 0;
-  UINTN panelY = (y0 >= 6) ? (y0 - 6) : 0;
-  UINTN panelW = barW + 12 + labelW + 12;
-  UINTN panelH = barH + 12;
-
   UINT32 panel  = PackPixel(Packer, 20, 20, 20);
   UINT32 border = PackPixel(Packer, 220, 220, 220);
   UINT32 text   = PackPixel(Packer, 240, 240, 240);
 
-  DrawRect(Fb, Width, Height, Ppsl, panelX, panelY, panelW, panelH, panel);
+  DrawRect(Fb, Width, Height, Ppsl, x0-6, y0-6, barW + 12 + labelW + 12, barH + 12, panel);
 
   for (UINTN y = 0; y < barH; y++) {
-    float t = 1.0f - (float)y / (float)((barH > 1) ? (barH - 1) : 1);
-    UINT8 r,g,b; TempToRGB_LUT(t, &r, &g, &b);
+    // t in [0..1] -> idx
+    INT32 tQ16 = (INT32)(((INT64)(barH - 1 - (INT32)y) * Q16_ONE) / (INT32)((barH > 1) ? (barH - 1) : 1));
+    UINT8 r,g,b;
+    TempQ16_ToRGB(tQ16, &r, &g, &b);
     UINT32 px = PackPixel(Packer, r, g, b);
     DrawRect(Fb, Width, Height, Ppsl, x0, y0 + y, barW, 1, px);
   }
 
-  UINTN bx = (x0 > 0) ? (x0 - 1) : 0;
-  UINTN by = (y0 > 0) ? (y0 - 1) : 0;
-  DrawRect(Fb, Width, Height, Ppsl, bx, by, barW + 2, 1, border);
-  DrawRect(Fb, Width, Height, Ppsl, bx, y0 + barH, barW + 2, 1, border);
-  DrawRect(Fb, Width, Height, Ppsl, bx, by, 1, barH + 2, border);
-  DrawRect(Fb, Width, Height, Ppsl, x0 + barW, by, 1, barH + 2, border);
+  DrawRect(Fb, Width, Height, Ppsl, x0-1, y0-1, barW+2, 1, border);
+  DrawRect(Fb, Width, Height, Ppsl, x0-1, y0+barH, barW+2, 1, border);
+  DrawRect(Fb, Width, Height, Ppsl, x0-1, y0-1, 1, barH+2, border);
+  DrawRect(Fb, Width, Height, Ppsl, x0+barW, y0-1, 1, barH+2, border);
 
   UINTN lx = x0 + barW + 10;
-  DrawString8(Fb, Width, Height, Ppsl, lx, y0 + 0,          "HOT  1.0", text, panel, FALSE);
-  DrawString8(Fb, Width, Height, Ppsl, lx, y0 + barH/2 - 4, "MID  0.5", text, panel, FALSE);
-  DrawString8(Fb, Width, Height, Ppsl, lx, y0 + barH - 8,   "COLD 0.0", text, panel, FALSE);
+  DrawString8(Fb, Width, Height, Ppsl, lx, y0 + 0,          "HOT  1.0", text);
+  DrawString8(Fb, Width, Height, Ppsl, lx, y0 + barH/2 - 4, "MID  0.5", text);
+  DrawString8(Fb, Width, Height, Ppsl, lx, y0 + barH - 8,   "COLD 0.0", text);
 }
 
 // -------------------- Pointer handling --------------------
 typedef struct {
   BOOLEAN HasAbs;
   BOOLEAN HasRel;
-
   EFI_ABSOLUTE_POINTER_PROTOCOL *Abs;
   EFI_SIMPLE_POINTER_PROTOCOL   *Rel;
-
   INT32 X;
   INT32 Y;
-
   INT32 AbsMinX, AbsMaxX;
   INT32 AbsMinY, AbsMaxY;
-
   BOOLEAN LastAbsValid;
   INT32   LastAbsX;
   INT32   LastAbsY;
-
   INT32 RelScale;
 } POINTER_STATE;
 
 STATIC VOID InitPointer(POINTER_STATE *P, EFI_SYSTEM_TABLE *SystemTable, UINTN Width, UINTN Height) {
   SetMem(P, sizeof(*P), 0);
-
   P->RelScale = 8;
   P->X = (INT32)(Width / 2);
   P->Y = (INT32)(Height / 2);
@@ -443,9 +406,7 @@ STATIC VOID InitPointer(POINTER_STATE *P, EFI_SYSTEM_TABLE *SystemTable, UINTN W
   }
 
   st = gBS->LocateProtocol(&gEfiSimplePointerProtocolGuid, NULL, (VOID**)&P->Rel);
-  if (!EFI_ERROR(st) && P->Rel) {
-    P->HasRel = TRUE;
-  }
+  if (!EFI_ERROR(st) && P->Rel) P->HasRel = TRUE;
 
   SystemTable->ConIn->Reset(SystemTable->ConIn, FALSE);
 }
@@ -465,10 +426,8 @@ STATIC BOOLEAN PollPointer(POINTER_STATE *P, UINTN Width, UINTN Height, BOOLEAN 
       INT32 ax = (INT32)st.CurrentX;
       INT32 ay = (INT32)st.CurrentY;
 
-      INT32 rx = P->AbsMaxX - P->AbsMinX;
-      INT32 ry = P->AbsMaxY - P->AbsMinY;
-      if (rx <= 0) rx = 1;
-      if (ry <= 0) ry = 1;
+      INT32 rx = P->AbsMaxX - P->AbsMinX; if (rx <= 0) rx = 1;
+      INT32 ry = P->AbsMaxY - P->AbsMinY; if (ry <= 0) ry = 1;
 
       absX = (INT32)((((INT64)(ax - P->AbsMinX)) * (INT64)((Width  > 0) ? (Width  - 1) : 0)) / rx);
       absY = (INT32)((((INT64)(ay - P->AbsMinY)) * (INT64)((Height > 0) ? (Height - 1) : 0)) / ry);
@@ -519,26 +478,24 @@ STATIC BOOLEAN PollPointer(POINTER_STATE *P, UINTN Width, UINTN Height, BOOLEAN 
   return moved || pressed;
 }
 
-// -------------------- Heatsink geometry (comb) --------------------
+// -------------------- Heatsink geometry + face K precompute --------------------
 typedef struct {
   INT32 baseX0, baseX1;
   INT32 baseY0, baseY1;
 } HEATSINK_GEOM;
 
-STATIC VOID BuildHeatsinkCombMask(float *K, UINT8 *Mat, INT32 NX, INT32 NY, HEATSINK_GEOM *G) {
-  // V3: stronger contrast (1:100) feels more heatsink-like
-  const float k_air = 0.01f;  // solid air, low conduction
-  const float k_cu  = 1.00f;  // copper reference
+STATIC VOID BuildHeatsinkCombMask_U16(UINT16 *Kcell, UINT8 *Mat, INT32 NX, INT32 NY, HEATSINK_GEOM *G) {
+  // V3 ratio: 1:100
+  const UINT16 k_air = (UINT16)(K_ONE / 100); // ~655
+  const UINT16 k_cu  = (UINT16)K_ONE;         // 65535
 
-  // Fill air
   for (INT32 j = 0; j < NY; j++) {
     for (INT32 i = 0; i < NX; i++) {
       Mat[j*NX + i] = 0;
-      K[j*NX + i] = k_air;
+      Kcell[j*NX + i] = k_air;
     }
   }
 
-  // Copper base plate near bottom
   INT32 marginX = NX / 8;
   INT32 baseW = NX - 2*marginX;
   INT32 baseH = NY / 10;
@@ -558,17 +515,17 @@ STATIC VOID BuildHeatsinkCombMask(float *K, UINT8 *Mat, INT32 NX, INT32 NY, HEAT
   for (INT32 j = baseY0; j <= baseY1; j++) {
     for (INT32 i = baseX0; i <= baseX1; i++) {
       Mat[j*NX + i] = 1;
-      K[j*NX + i] = k_cu;
+      Kcell[j*NX + i] = k_cu;
     }
   }
 
-  // Copper fins (comb) above base
+  // Fins
   INT32 finH  = NY / 3;
   INT32 finY0 = baseY0 - finH;
   INT32 finY1 = baseY0;
   if (finY0 < 2) finY0 = 2;
 
-  INT32 finCount = 14;
+  INT32 finCount = 28; // more fins looks nicer at 2x grid
   INT32 gap = baseW / finCount;
   if (gap < 6) gap = 6;
 
@@ -579,19 +536,18 @@ STATIC VOID BuildHeatsinkCombMask(float *K, UINT8 *Mat, INT32 NX, INT32 NY, HEAT
     INT32 cx = baseX0 + f * gap + gap/2;
     INT32 x0 = cx - finW/2;
     INT32 x1 = x0 + finW - 1;
-
     x0 = ClampI32(x0, baseX0, baseX1);
     x1 = ClampI32(x1, baseX0, baseX1);
 
     for (INT32 j = finY0; j <= finY1; j++) {
       for (INT32 i = x0; i <= x1; i++) {
         Mat[j*NX + i] = 1;
-        K[j*NX + i] = k_cu;
+        Kcell[j*NX + i] = k_cu;
       }
     }
   }
 
-  // Copper "die block" under base (still copper)
+  // Die block under base
   INT32 dieW = baseW / 6;
   INT32 dieH = baseH / 2;
   INT32 dieX0 = (NX/2) - dieW/2;
@@ -603,35 +559,34 @@ STATIC VOID BuildHeatsinkCombMask(float *K, UINT8 *Mat, INT32 NX, INT32 NY, HEAT
   for (INT32 j = dieY0; j <= dieY1; j++) {
     for (INT32 i = dieX0; i <= dieX1; i++) {
       Mat[j*NX + i] = 1;
-      K[j*NX + i] = k_cu;
+      Kcell[j*NX + i] = k_cu;
     }
   }
 }
 
-STATIC VOID PrecomputeFaceConductivities(const float *K, float *Kx, float *Ky, INT32 NX, INT32 NY) {
-  // Kx[idx] = k at face between (i,j) and (i+1,j), valid for i in [0..NX-2]
-  // Ky[idx] = k at face between (i,j) and (i,j+1), valid for j in [0..NY-2]
+// Precompute face K in Q0.16 (UINT16) using harmonic mean.
+// Uses integer math: k_face = (2*k0*k1)/(k0+k1)
+STATIC UINT16 KFaceHarmonic_U16(UINT16 k0, UINT16 k1) {
+  UINT32 denom = (UINT32)k0 + (UINT32)k1;
+  if (denom == 0) return 0;
+  UINT32 num = 2u * (UINT32)k0 * (UINT32)k1;
+  return (UINT16)(num / denom);
+}
+
+STATIC VOID PrecomputeFaceK_U16(const UINT16 *Kcell, UINT16 *Kx, UINT16 *Ky, INT32 NX, INT32 NY) {
   for (INT32 j = 0; j < NY; j++) {
     INT32 row = j*NX;
     for (INT32 i = 0; i < NX; i++) {
       INT32 idx = row + i;
-
-      if (i < NX-1) {
-        Kx[idx] = KFaceHarmonic(K[idx], K[idx + 1]);
-      } else {
-        Kx[idx] = 0.0f; // unused (no right neighbor)
-      }
-
-      if (j < NY-1) {
-        Ky[idx] = KFaceHarmonic(K[idx], K[idx + NX]);
-      } else {
-        Ky[idx] = 0.0f; // unused (no down neighbor)
-      }
+      if (i < NX-1) Kx[idx] = KFaceHarmonic_U16(Kcell[idx], Kcell[idx+1]);
+      else Kx[idx] = 0;
+      if (j < NY-1) Ky[idx] = KFaceHarmonic_U16(Kcell[idx], Kcell[idx+NX]);
+      else Ky[idx] = 0;
     }
   }
 }
 
-// -------------------- Main --------------------
+// ==================== Main ====================
 EFI_STATUS EFIAPI UefiMain(IN EFI_HANDLE ImageHandle, IN EFI_SYSTEM_TABLE *SystemTable) {
   EFI_STATUS Status;
   EFI_GRAPHICS_OUTPUT_PROTOCOL *Gop = NULL;
@@ -654,67 +609,64 @@ EFI_STATUS EFIAPI UefiMain(IN EFI_HANDLE ImageHandle, IN EFI_SYSTEM_TABLE *Syste
 
   PIXEL_PACKER Packer;
   Packer.Fmt = Info->PixelFormat;
-
   if (Packer.Fmt == PixelBltOnly) {
     Print(L"Error: GOP PixelFormat is PixelBltOnly.\n");
     Print(L"This demo requires direct framebuffer access.\n");
     return EFI_UNSUPPORTED;
   }
-  if (Packer.Fmt == PixelBitMask) {
-    Packer.Masks = Info->PixelInformation;
-  } else {
-    SetMem(&Packer.Masks, sizeof(Packer.Masks), 0);
-  }
+  if (Packer.Fmt == PixelBitMask) Packer.Masks = Info->PixelInformation;
+  else SetMem(&Packer.Masks, sizeof(Packer.Masks), 0);
 
   BuildViridisLikeLut();
 
   UINT32 *Fb = (UINT32*)(UINTN)Gop->Mode->FrameBufferBase;
 
-  // ---- Simulation grid ----
-  const INT32 NX = 260;
-  const INT32 NY = 220;
+  // ======= 2x grid size =======
+  const INT32 NX = 520;
+  const INT32 NY = 440;
 
-  float *A   = AllocateZeroPool(sizeof(float) * NX * NY);
-  float *B   = AllocateZeroPool(sizeof(float) * NX * NY);
-  float *K   = AllocateZeroPool(sizeof(float) * NX * NY);   // cell conductivity
-  float *Kx  = AllocateZeroPool(sizeof(float) * NX * NY);   // face (right) conductivity
-  float *Ky  = AllocateZeroPool(sizeof(float) * NX * NY);   // face (down) conductivity
-  UINT8 *Mat = AllocateZeroPool(sizeof(UINT8) * NX * NY);   // 0 air, 1 copper
+  // Temperatures in Q16.16
+  INT32 *A = AllocateZeroPool(sizeof(INT32) * NX * NY);
+  INT32 *B = AllocateZeroPool(sizeof(INT32) * NX * NY);
 
-  if (!A || !B || !K || !Kx || !Ky || !Mat) {
+  // Conductivity in Q0.16 (cell + faces)
+  UINT16 *Kcell = AllocateZeroPool(sizeof(UINT16) * NX * NY);
+  UINT16 *Kx    = AllocateZeroPool(sizeof(UINT16) * NX * NY);
+  UINT16 *Ky    = AllocateZeroPool(sizeof(UINT16) * NX * NY);
+
+  UINT8  *Mat   = AllocateZeroPool(sizeof(UINT8)  * NX * NY);
+
+  if (!A || !B || !Kcell || !Kx || !Ky || !Mat) {
     Print(L"Out of memory\n");
     if (A) FreePool(A);
     if (B) FreePool(B);
-    if (K) FreePool(K);
+    if (Kcell) FreePool(Kcell);
     if (Kx) FreePool(Kx);
     if (Ky) FreePool(Ky);
+
     if (Mat) FreePool(Mat);
     return EFI_OUT_OF_RESOURCES;
   }
 
   HEATSINK_GEOM G;
-  BuildHeatsinkCombMask(K, Mat, NX, NY, &G);
+  BuildHeatsinkCombMask_U16(Kcell, Mat, NX, NY, &G);
+  PrecomputeFaceK_U16(Kcell, Kx, Ky, NX, NY);
 
-  // Precompute face conductivities once (removes harmonic/divisions from hot loop)
-  PrecomputeFaceConductivities(K, Kx, Ky, NX, NY);
+  // baseR in Q16.16. 0.20 -> ~13107
+  const INT32 baseR_Q16 = (INT32)(0.20f * (float)Q16_ONE + 0.5f);
 
-  // Stability: baseR <= 0.25 for max k ~ 1.
-  const float baseR = 0.20f;
-
-  // Three rectangular heat sources (same temperature) at the bottom of the base plate.
-  const float heatTemp = 1.0f;
+  // Heat sources (Q16.16)
+  const INT32 heatTempQ = Q16_ONE;
 
   INT32 baseW = G.baseX1 - G.baseX0 + 1;
   INT32 baseH = G.baseY1 - G.baseY0 + 1;
 
-  INT32 srcH = ClampI32(baseH / 2, 2, baseH);
+  INT32 srcH  = ClampI32(baseH / 2, 2, baseH);
   INT32 srcY0 = G.baseY1 - srcH + 1;
-
-  INT32 srcW = ClampI32(baseW / 8, 6, baseW / 3);
-  INT32 gap  = ClampI32(baseW / 12, 4, baseW / 4);
+  INT32 srcW  = ClampI32(baseW / 8, 10, baseW / 3);
+  INT32 gap   = ClampI32(baseW / 12, 6, baseW / 4);
 
   INT32 mid = (G.baseX0 + G.baseX1) / 2;
-
   INT32 s0x0 = mid - (srcW/2) - (srcW + gap);
   INT32 s1x0 = mid - (srcW/2);
   INT32 s2x0 = mid - (srcW/2) + (srcW + gap);
@@ -722,9 +674,9 @@ EFI_STATUS EFIAPI UefiMain(IN EFI_HANDLE ImageHandle, IN EFI_SYSTEM_TABLE *Syste
   if (s0x0 < G.baseX0) s0x0 = G.baseX0;
   if (s2x0 + srcW - 1 > G.baseX1) s2x0 = G.baseX1 - srcW + 1;
 
-  // User brush
-  INT32 brushRad = NX / 35;
-  float brushTemp = 1.0f;
+  // Brush
+  INT32 brushRad = NX / 70;
+  INT32 brushTempQ = Q16_ONE; // default 1.0
 
   BOUNDARY_MODE bc = BC_DIRICHLET_COLD;
   BOOLEAN Paused = FALSE;
@@ -735,13 +687,17 @@ EFI_STATUS EFIAPI UefiMain(IN EFI_HANDLE ImageHandle, IN EFI_SYSTEM_TABLE *Syste
   if (cellW < 1) cellW = 1;
   if (cellH < 1) cellH = 1;
 
-  UINTN drawSkip = 1;
-  if (Width * Height > 1920u * 1080u) drawSkip = 2;
-
   UINTN drawW = (UINTN)NX * cellW;
   UINTN drawH = (UINTN)NY * cellH;
   if (drawW > Width)  drawW = Width;
   if (drawH > Height) drawH = Height;
+
+  // Adaptive drawSkip so rendering doesn't explode with 2x grid
+  UINTN drawSkip = 1;
+  // If output is big, subsample more
+  if (Width * Height > 1280u * 720u)  drawSkip = 2;
+  if (Width * Height > 1920u * 1080u) drawSkip = 3;
+  if (Width * Height > 2560u * 1440u) drawSkip = 4;
 
   POINTER_STATE Ptr;
   InitPointer(&Ptr, SystemTable, Width, Height);
@@ -752,34 +708,33 @@ EFI_STATUS EFIAPI UefiMain(IN EFI_HANDLE ImageHandle, IN EFI_SYSTEM_TABLE *Syste
   BOOLEAN dirty = TRUE;
 
   while (TRUE) {
-    // ---- Keyboard ----
     EFI_INPUT_KEY Key;
     while (TryReadKey(SystemTable, &Key)) {
       if (Key.ScanCode == SCAN_ESC) goto done;
 
       if (Key.UnicodeChar == L' ') { Paused = !Paused; dirty = TRUE; }
       else if (Key.UnicodeChar == L'r' || Key.UnicodeChar == L'R') {
-        SetMem(A, sizeof(float)*NX*NY, 0);
-        SetMem(B, sizeof(float)*NX*NY, 0);
+        SetMem(A, sizeof(INT32)*NX*NY, 0);
+        SetMem(B, sizeof(INT32)*NX*NY, 0);
         dirty = TRUE;
       } else if (Key.UnicodeChar == L'c' || Key.UnicodeChar == L'C') {
-        SetMem(A, sizeof(float)*NX*NY, 0);
+        SetMem(A, sizeof(INT32)*NX*NY, 0);
         dirty = TRUE;
       } else if (Key.UnicodeChar == L'b' || Key.UnicodeChar == L'B') {
         bc = (BOUNDARY_MODE)((bc + 1) % BC_COUNT);
         dirty = TRUE;
       } else if (Key.UnicodeChar == L'+' || Key.UnicodeChar == L'=') {
-        brushRad = ClampI32(brushRad + 2, 2, NX/4);
+        brushRad = ClampI32(brushRad + 2, 2, NX/8);
         dirty = TRUE;
       } else if (Key.UnicodeChar == L'-' || Key.UnicodeChar == L'_') {
-        brushRad = ClampI32(brushRad - 2, 2, NX/4);
+        brushRad = ClampI32(brushRad - 2, 2, NX/8);
         dirty = TRUE;
-      } else if (Key.UnicodeChar == L'1') { brushTemp = 0.5f; dirty = TRUE; }
-      else if (Key.UnicodeChar == L'2') { brushTemp = 0.8f; dirty = TRUE; }
-      else if (Key.UnicodeChar == L'3') { brushTemp = 1.0f; dirty = TRUE; }
+      } else if (Key.UnicodeChar == L'1') { brushTempQ = (INT32)(0.5f * (float)Q16_ONE + 0.5f); dirty = TRUE; }
+      else if (Key.UnicodeChar == L'2') { brushTempQ = (INT32)(0.8f * (float)Q16_ONE + 0.5f); dirty = TRUE; }
+      else if (Key.UnicodeChar == L'3') { brushTempQ = Q16_ONE; dirty = TRUE; }
     }
 
-    // ---- Pointer ----
+    // Pointer
     BOOLEAN pressed = FALSE;
     BOOLEAN ptrEvent = PollPointer(&Ptr, Width, Height, &pressed);
 
@@ -789,61 +744,70 @@ EFI_STATUS EFIAPI UefiMain(IN EFI_HANDLE ImageHandle, IN EFI_SYSTEM_TABLE *Syste
     gy = ClampI32(gy, 0, NY-1);
 
     if (pressed) {
-      StampDisk(A, NX, NY, gx, gy, brushRad, brushTemp);
+      StampDiskQ16(A, NX, NY, gx, gy, brushRad, brushTempQ);
       dirty = TRUE;
     } else if (ptrEvent) {
       dirty = TRUE;
     }
 
-    // ---- Simulation (pure conduction, fast hot loop) ----
+    // Simulation
     if (!Paused) {
-      // Re-stamp 3 rectangular heat sources (same temperature) on base bottom
-      StampRectMax(A, NX, NY, s0x0, srcY0, srcW, srcH, heatTemp);
-      StampRectMax(A, NX, NY, s1x0, srcY0, srcW, srcH, heatTemp);
-      StampRectMax(A, NX, NY, s2x0, srcY0, srcW, srcH, heatTemp);
+      // 3 rectangular sources on base bottom
+      StampRectMaxQ16(A, NX, NY, s0x0, srcY0, srcW, srcH, heatTempQ);
+      StampRectMaxQ16(A, NX, NY, s1x0, srcY0, srcW, srcH, heatTempQ);
+      StampRectMaxQ16(A, NX, NY, s2x0, srcY0, srcW, srcH, heatTempQ);
 
-      // ∂T/∂t = ∇·(k∇T) using precomputed face conductivities
+      // Hot loop: all fixed-point, precomputed face k
       for (INT32 j = 1; j < NY-1; j++) {
         INT32 row = j*NX;
         for (INT32 i = 1; i < NX-1; i++) {
           INT32 idx = row + i;
 
-          float tC = A[idx];
-          float tR = A[idx + 1];
-          float tL = A[idx - 1];
-          float tD = A[idx + NX];
-          float tU = A[idx - NX];
+          INT32 tC = A[idx];
+          INT32 tR = A[idx + 1];
+          INT32 tL = A[idx - 1];
+          INT32 tD = A[idx + NX];
+          INT32 tU = A[idx - NX];
 
-          // Faces:
-          // right face uses Kx[idx]
-          // left  face uses Kx[idx-1]
-          // down  face uses Ky[idx]
-          // up    face uses Ky[idx-NX]
-          float flux_r = Kx[idx]     * (tR - tC);
-          float flux_l = Kx[idx - 1] * (tL - tC);
-          float flux_d = Ky[idx]     * (tD - tC);
-          float flux_u = Ky[idx - NX] * (tU - tC);
+          // flux = k_face * (tN - tC)
+          // k_face is Q0.16, deltaT is Q16.16
+          // flux becomes Q16.16 after shifting down 16
+          INT64 flux_r = ((INT64)Kx[idx]     * (INT64)(tR - tC)) >> 16;
+          INT64 flux_l = ((INT64)Kx[idx - 1] * (INT64)(tL - tC)) >> 16;
+          INT64 flux_d = ((INT64)Ky[idx]     * (INT64)(tD - tC)) >> 16;
+          INT64 flux_u = ((INT64)Ky[idx - NX]* (INT64)(tU - tC)) >> 16;
 
-          B[idx] = tC + baseR * (flux_r + flux_l + flux_d + flux_u);
+          INT64 flux_sum = flux_r + flux_l + flux_d + flux_u; // Q16.16
+
+          // dt term: baseR_Q16 (Q16.16) * flux_sum (Q16.16) -> Q32.32 -> shift 16 -> Q16.16
+          INT64 delta = ((INT64)baseR_Q16 * flux_sum) >> 16;
+
+          INT64 out = (INT64)tC + delta;
+
+          // clamp to [0..1]
+          if (out < 0) out = 0;
+          if (out > Q16_ONE) out = Q16_ONE;
+
+          B[idx] = (INT32)out;
         }
       }
 
-      ApplyBoundary(B, NX, NY, bc);
+      ApplyBoundaryQ16(B, NX, NY, bc);
 
-      float *Tmp = A; A = B; B = Tmp;
+      INT32 *Tmp = A; A = B; B = Tmp;
       dirty = TRUE;
     }
 
-    // ---- Render ----
+    // Render
     if (dirty) {
       for (INT32 j = 0; j < NY; j += (INT32)drawSkip) {
         for (INT32 i = 0; i < NX; i += (INT32)drawSkip) {
-          float t = A[j*NX + i];
+          INT32 tQ = A[j*NX + i];
 
           UINT8 rr, gg, bb;
-          TempToRGB_LUT(t, &rr, &gg, &bb);
+          TempQ16_ToRGB(tQ, &rr, &gg, &bb);
 
-          // Visual tint so comb reads as copper
+          // Copper tint (visual only)
           if (Mat[j*NX + i] == 1) {
             rr = (UINT8)ClampI32((INT32)rr + 10, 0, 255);
             gg = (UINT8)((UINT32)gg * 240u / 255u);
@@ -876,15 +840,12 @@ EFI_STATUS EFIAPI UefiMain(IN EFI_HANDLE ImageHandle, IN EFI_SYSTEM_TABLE *Syste
       dirty = FALSE;
     }
 
-    gBS->Stall(4000);
+    // gBS->Stall(4000);
   }
 
 done:
-  FreePool(A);
-  FreePool(B);
-  FreePool(K);
-  FreePool(Kx);
-  FreePool(Ky);
+  FreePool(A); FreePool(B);
+  FreePool(Kcell); FreePool(Kx); FreePool(Ky);
   FreePool(Mat);
   Print(L"Exit.\n");
   return EFI_SUCCESS;
