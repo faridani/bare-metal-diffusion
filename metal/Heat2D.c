@@ -75,7 +75,7 @@ private:
     void ResetField();
     void StepSimulation(float dt);
     void Render();
-    void StampHeat(unsigned cx, unsigned cy, float value);
+    void StampHeat(float* buffer, unsigned cx, unsigned cy, float value);
     void NextPalette();
 
 private:
@@ -166,14 +166,14 @@ void CHeat2DKernel::ResetField() {
     }
 }
 
-void CHeat2DKernel::StampHeat(unsigned cx, unsigned cy, float value) {
+void CHeat2DKernel::StampHeat(float* buffer, unsigned cx, unsigned cy, float value) {
     for (int dy = -static_cast<int>(kHeatDiskRadius); dy <= static_cast<int>(kHeatDiskRadius); ++dy) {
         for (int dx = -static_cast<int>(kHeatDiskRadius); dx <= static_cast<int>(kHeatDiskRadius); ++dx) {
             int x = static_cast<int>(cx) + dx;
             int y = static_cast<int>(cy) + dy;
             if (x < 1 || y < 1 || x >= static_cast<int>(kSimW - 1) || y >= static_cast<int>(kSimH - 1)) continue;
             if (dx*dx + dy*dy <= static_cast<int>(kHeatDiskRadius * kHeatDiskRadius)) {
-                m_Field[y * kSimW + x] = value;
+                buffer[y * kSimW + x] = value;
             }
         }
     }
@@ -203,7 +203,7 @@ void CHeat2DKernel::StepSimulation(float dt) {
     }
 
     // Center heater
-    StampHeat(kSimW / 2, kSimH / 2, 1.0f);
+    StampHeat(m_FieldNext, kSimW / 2, kSimH / 2, 1.0f);
 
     float* tmp = m_Field;
     m_Field = m_FieldNext;
