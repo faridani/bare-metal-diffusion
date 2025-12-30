@@ -40,6 +40,11 @@ static constexpr float kAirStrength = 0.06f;        // convection coupling
 static constexpr float kMouseHeat = 0.9f;
 static constexpr float kAmbient = 0.08f;
 static constexpr float kSinkTemperature = 1.5f;
+static constexpr unsigned kSinkHalfWidth = 12;
+static constexpr unsigned kSinkHalfHeight = 8;
+static constexpr float kMaxRenderTemp = 1.6f;
+static constexpr float kTempToShadeFactor = 160.0f;
+static constexpr float kTimeStep = 0.12f;
 
 struct RGB
 {
@@ -166,9 +171,9 @@ void CHeat2DKernel::ResetGrid ()
 	std::fill (m_AirUx.begin (), m_AirUx.end (), 0.0f);
 	std::fill (m_AirUy.begin (), m_AirUy.end (), 0.0f);
 
-	for (unsigned y = kHeight / 2 - 8; y < kHeight / 2 + 8; ++y)
+	for (unsigned y = kHeight / 2 - kSinkHalfHeight; y < kHeight / 2 + kSinkHalfHeight; ++y)
 	{
-		for (unsigned x = kWidth / 2 - 12; x < kWidth / 2 + 12; ++x)
+		for (unsigned x = kWidth / 2 - kSinkHalfWidth; x < kWidth / 2 + kSinkHalfWidth; ++x)
 		{
 			m_Temp[GetBufferOffset (x, y)] = kSinkTemperature;
 		}
@@ -219,8 +224,8 @@ void CHeat2DKernel::UpdateHeat (float dt)
 				float next = m_Temp[idx] + kAlpha * laplace - dt * (advectX + advectY);
 
 				// Keep the heat sink pinned hot.
-				if (x > kWidth / 2 - 12 && x < kWidth / 2 + 12 &&
-				    y > kHeight / 2 - 8 && y < kHeight / 2 + 8)
+				if (x > kWidth / 2 - kSinkHalfWidth && x < kWidth / 2 + kSinkHalfWidth &&
+				    y > kHeight / 2 - kSinkHalfHeight && y < kHeight / 2 + kSinkHalfHeight)
 				{
 					next = kSinkTemperature;
 				}
@@ -280,8 +285,8 @@ void CHeat2DKernel::Render ()
 		for (unsigned x = 0; x < kWidth; ++x)
 		{
 			const unsigned idx = GetBufferOffset (x, y);
-			const float t = std::clamp (m_Temp[idx], 0.0f, 1.6f);
-			const unsigned shade = static_cast<unsigned> (std::min (255.0f, t * 160.0f));
+			const float t = std::clamp (m_Temp[idx], 0.0f, kMaxRenderTemp);
+			const unsigned shade = static_cast<unsigned> (std::min (255.0f, t * kTempToShadeFactor));
 			const RGB color = palette[shade];
 			m_Screen.WritePixel (x, y, color.r, color.g, color.b);
 		}
@@ -298,7 +303,7 @@ boolean CHeat2DKernel::Run (void)
 
 	while (1)
 	{
-		const float dt = 0.12f;
+		const float dt = kTimeStep;
 		HandleInput ();
 		UpdateHeat (dt);
 		Render ();
