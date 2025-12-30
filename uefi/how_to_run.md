@@ -40,6 +40,7 @@ mv ./uefi-2D-heat-diffusion ./edk2/Heat2D
 cd edk2
 make -C BaseTools
 . edksetup.sh
+export GCC5_AARCH64_PREFIX=aarch64-linux-gnu-
 ```
 
 ### 4) Build the UEFI application (DEBUG)
@@ -49,5 +50,7 @@ build -a AARCH64 -t GCC5 -b DEBUG -p Heat2D/Heat2D.dsc
 ```
 
 The output EFI will be located at `Build/Heat2DPlatform/DEBUG_GCC5/AARCH64/Heat2D.efi`.
+
+> **Tip:** If you see `gcc: error: unrecognized command-line option '-mlittle-endian'` while building, it means the AArch64 cross-compiler is missing or `GCC5_AARCH64_PREFIX` was not set. Install `gcc-aarch64-linux-gnu` and re-run `export GCC5_AARCH64_PREFIX=aarch64-linux-gnu-` before invoking `build`.
 
 From this point on you can run the remaining steps in `Heat2D.sh` to test the code.
